@@ -1,0 +1,12 @@
+streamlit
+python-dotenv
+PyPDF2
+python-docx
+sentence-transformers
+numpy
+pandas
+chromadb
+langchain
+langchain-community
+langchain-ollama
+requests
