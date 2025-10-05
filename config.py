@@ -22,7 +22,7 @@ class Config:
     VECTOR_STORE_DIR = "vectorstore"
     
     # Streamlit Configuration
-    PAGE_TITLE = "RAG Q&A System"
+    PAGE_TITLE = "NetSec-Tutor"
 
     PAGE_ICON = "🤖"
 
