@@ -14,91 +14,113 @@ from utils.session_store import (
 )
 from config import Config
 
-# ------------------ Streamlit Page Config ------------------
+# ------------------ Main Page UI Config ------------------
 st.set_page_config(
     page_title=Config.PAGE_TITLE,
     page_icon=Config.PAGE_ICON,
     layout="wide"
 )
 
-# ------------------ Custom CSS ------------------
+# ------------------ Custom Styling using CSS with "unsafe_allow_html=True" ------------------
 st.markdown("""
-    <style>
-    html, body, [class*="css"] {
-        font-family: 'Segoe UI', sans-serif;
-    }
+<style>
+html, body, [class*="css"] {
+    font-family: 'Segoe UI', sans-serif;
+    overflow: hidden; /* prevent whole-page scroll */
+}
 
-    /* Titles */
-    .main-title {
-        text-align: center;
-        color: var(--text-color);
-        font-size: 36px;
-        font-weight: 700;
-        margin-bottom: 10px;
-    }
-    .subheader {
-        text-align: center;
-        font-size: 18px;
-        color: var(--text-color);
-        opacity: 0.75;
-        margin-bottom: 30px;
-    }
+/* ===== Fixed Header ===== */
+.header-container {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    text-align: center;
+    background: var(--background-color, #0e1117);
+    z-index: 1001;
+    padding: 20px 0 15px 0;
+    border-bottom: 1px solid rgba(128,128,128,0.2);
+}
 
-    /* Sidebar styling */
-    section[data-testid="stSidebar"] {
-        background-color: var(--secondary-background-color);
-        border-right: 1px solid rgba(128,128,128,0.2);
-        z-index: 999;
-    }
+.header-container .main-title {
+    color: var(--text-color, #fff);
+    font-size: 36px;
+    font-weight: 700;
+    margin-bottom: 4px;
+}
 
-    /* Buttons */
-    button[kind="primary"], button[kind="secondary"] {
-        width: 100% !important;
-        border-radius: 10px !important;
-        font-weight: 600 !important;
-    }
+.header-container .subheader {
+    font-size: 18px;
+    color: var(--text-color, #ccc);
+    opacity: 0.8;
+    margin: 0;
+}
 
-    .viewer-container {
-        background-color: var(--background-color);
-        padding: 10px 0 0 0;
-        border-radius: 10px;
-    }
+/* ===== Layout adjustments ===== */
+[data-testid="stAppViewContainer"] .block-container {
+    padding-top: 120px !important; /* Space for header */
+    padding-bottom: 100px !important;
+    overflow: hidden;
+}
 
-    /* === Chat Layout Fix === */
-    /* Make only the chat area scrollable, not the whole page */
-    [data-testid="stAppViewContainer"] .block-container {
-        padding-bottom: 100px !important;
-        overflow: hidden; /* Prevent global scroll */
-    }
+/* ===== Scrollable chat area only ===== */
+div[data-testid="stVerticalBlock"]:has(.stChatMessage) {
+    max-height: calc(100vh - 220px);
+    overflow-y: auto;
+    padding-right: 12px;
+    scroll-behavior: smooth;
+}
 
-    /* The chat column */
-    div[data-testid="stVerticalBlock"]:has(.stChatMessage) {
-        max-height: calc(100vh - 180px); /* full height minus header/subheader/input */
-        overflow-y: auto;
-        padding-right: 12px;
-    }
+/* ===== Fixed chat input ===== */
+[data-testid="stChatInput"] {
+    position: fixed !important;
+    bottom: 0 !important;
+    left: var(--chat-left-offset, 300px) !important;
+    right: 0 !important;
+    z-index: 1000 !important;
+    background: var(--background-color, #0e1117);
+    padding: 8px 16px 16px 16px;
+    box-shadow: 0 -2px 8px rgba(0,0,0,0.1);
+}
 
-    /* Fix the chat input bar to the bottom of main area (not sidebar) */
+/* ===== Mobile sidebar collapse ===== */
+@media (max-width: 900px) {
     [data-testid="stChatInput"] {
-        position: fixed !important;
-        bottom: 0 !important;
-        left: var(--chat-left-offset, 300px) !important;
-        right: 0 !important;
-        z-index: 1000 !important;
-        background: var(--background-color, #0e1117);
-        padding: 8px 16px 16px 16px;
-        box-shadow: 0 -2px 8px rgba(0,0,0,0.1);
+        left: 0 !important;
     }
+}
 
-    /* Mobile: sidebar collapses, let chat input span full width */
-    @media (max-width: 900px) {
-        [data-testid="stChatInput"] {
-            left: 0 !important;
+/* ===== Smooth auto-scroll ===== */
+</style>
+
+<script>
+const chatContainerObserver = new MutationObserver(() => {
+    const chatBlocks = document.querySelectorAll('div[data-testid="stVerticalBlock"]');
+    chatBlocks.forEach(block => {
+        if (block.querySelector('.stChatMessage')) {
+            block.scrollTop = block.scrollHeight;
         }
-    }
-    </style>
-""", unsafe_allow_html=True)
+    });
+});
+chatContainerObserver.observe(document.body, { childList: true, subtree: true });
+</script>
+<style>
+/* Hide Streamlit's built-in 'Limit 200MB per file' text */
+[data-testid="stFileUploaderDropzone"] small {
+    visibility: hidden;
+}
 
+/* Inject our own limit text */
+[data-testid="stFileUploaderDropzone"]::after {
+    content: "Limit 25 MB per file • PDF, DOCX, TXT";
+    display: block;
+    font-size: 0.8rem;
+    color: rgba(255,255,255,0.7);
+    text-align: center;
+    margin-top: 4px;
+}
+</style>
+""", unsafe_allow_html=True)
 
 
 # ------------------ Initialize Session State ------------------
@@ -183,10 +205,10 @@ def initialize_components():
 # --- PDF/DOCX/TXT viewer utilities ---
 def display_pdf(file_path: str, height: int = 820) -> bool:
     """
-    Try 3 strategies to display the PDF.
+    Try 3 ways to display the PDF.
     Returns True if something was rendered; False otherwise.
     """
-    # 1) Best: streamlit-pdf-viewer (pip install streamlit-pdf-viewer)
+    # streamlit-pdf-viewer
     try:
         from streamlit_pdf_viewer import pdf_viewer
         with open(file_path, "rb") as f:
@@ -196,7 +218,7 @@ def display_pdf(file_path: str, height: int = 820) -> bool:
     except Exception:
         pass
 
-    # 2) Fallback: base64 iframe (works widely)
+    #Fallback: base64 iframe (works widely)
     try:
         import base64
         from streamlit.components.v1 import html as st_html
@@ -211,7 +233,7 @@ def display_pdf(file_path: str, height: int = 820) -> bool:
     except Exception:
         pass
 
-    # 3) Last resort: render page images via PyMuPDF (pip install pymupdf)
+    # render page images with PyMuPDF
     try:
         import fitz  # PyMuPDF
         doc = fitz.open(file_path)
@@ -249,25 +271,25 @@ def display_docx_file(path: str):
 # ------------------ Main UI ------------------
 def main():
     st.markdown('<h1 class="main-title">NetSec Tutor</h1>', unsafe_allow_html=True)
-    st.markdown('<p class="subheader">An easy way to study and test your network security skills..</p>', unsafe_allow_html=True)
+    st.markdown('<p class="subheader">An easy way to study and test your network security skills...</p>', unsafe_allow_html=True)
 
-    # Check Ollama availability
+    # Checking Ollama availability
     try:
         import requests
         response = requests.get(f"{Config.OLLAMA_BASE_URL}/api/tags")
         if response.status_code != 200:
-            st.error("⚠ Could not connect to Ollama service! Please ensure Ollama is running.")
-            st.info("Install Ollama from: https://ollama.ai")
+            st.error("Could Not find any model from Ollama is running, make sure a model from Ollama is running.")
+            st.info("Run ollama by 'ollama run mistral' ")
             return
     except Exception:
-        st.error("⚠ Could not connect to Ollama service! Please ensure Ollama is running.")
-        st.info("Install Ollama from: https://ollama.ai")
+        st.error("Could Not find any model from Ollama is running, make sure a model from Ollama is running.")
+        st.info("Run ollama by 'ollama run mistral' ")
         return
 
     # Initialize components
     initialize_components()
 
-    # Load most recent session if any; do not create a new one until first user message
+    # Load most recent session if any
     if not st.session_state.session_loaded:
         recent = most_recent_session()
         if recent:
@@ -282,12 +304,12 @@ def main():
 
     # Sidebar
     with st.sidebar:
-        st.header("📚 Document Management")
+        st.header("📂 Document Management")
         uploaded_files = st.file_uploader(
             "Upload Documents",
             type=['pdf', 'docx', 'txt'],
             accept_multiple_files=True,
-            help="Upload PDF, DOCX, or TXT files"
+            help="Each file must be under 25 MB. Supported formats: PDF, DOCX, TXT."
         )
         max_size = 25 * 1024 * 1024 #25MB max file size for each file
         if uploaded_files:
@@ -392,7 +414,7 @@ def main():
                     st.markdown(str(entry))
 
         # Chat input at bottom
-        prompt = st.chat_input("Ask about your documents…")
+        prompt = st.chat_input("Ask Anything related to Network Security Course...")
         if prompt is not None:
             if not st.session_state.documents_processed:
                 st.warning("Please upload and process documents before asking questions.", icon="⚠️")
@@ -401,9 +423,9 @@ def main():
             elif not st.session_state.rag_chain:
                 st.error("Unexpected error: RAG chain not initialized.")
             else:
-                # Append user message
+                # Appending user message
                 st.session_state.chat_history.append({"role": "user", "content": prompt})
-                # Persist after user message; if first message of a new chat, create session with title
+                # Persist after user message; if first message of a new chat, create a new chat session
                 if st.session_state.get("session_id"):
                     try:
                         save_session(st.session_state.session_id, st.session_state.chat_history, st.session_state.get("session_title"))
@@ -428,14 +450,14 @@ def main():
                 with st.chat_message("user"):
                     st.markdown(prompt)
 
-                # Generate assistant reply using RAG with (optional) history
+                # Generate assistant reply using RAG context history
                 with st.chat_message("assistant"):
                     with st.spinner("🤔 Thinking..."):
                         result = st.session_state.rag_chain.chat_with_context(prompt, chat_history=st.session_state.chat_history)
                     answer = result.get("answer", "")
                     st.markdown(answer)
 
-                    # Append assistant message with metadata
+                    # Append assistant message with required metadata
                     assistant_entry = {
                         "role": "assistant",
                         "content": answer,
@@ -444,7 +466,7 @@ def main():
                     }
                     st.session_state.chat_history.append(assistant_entry)
 
-                    # Persist session after assistant reply
+                    # Persist session after each of the assistant reply
                     if st.session_state.get("session_id"):
                         try:
                             save_session(st.session_state.session_id, st.session_state.chat_history, st.session_state.get("session_title"))
@@ -462,8 +484,7 @@ def main():
                             st.text_area("Context used for answering:", assistant_entry.get("context", ""), height=200)
 
     with col2:
-        # --- Chat Sessions Moved Here ---
-        st.subheader("💾 Chat Sessions")
+        st.subheader("⏱ Chat History")
 
         sessions_meta = list_sessions()
         session_options = [
@@ -478,7 +499,7 @@ def main():
                 break
 
         selected = st.selectbox(
-            "Select session",
+            "Select Chat Session, for new chat session click 'New Chat' below.",
             options=range(len(sessions_meta)) if sessions_meta else [0],
             format_func=lambda i: session_options[i] if sessions_meta else "(No sessions)",
             index=current_index if sessions_meta else 0,
@@ -497,7 +518,7 @@ def main():
                 st.rerun()
 
         with cols[1]:
-            if st.button("🗑 Delete Chat", use_container_width=True, disabled=not sessions_meta):
+            if st.button("🗑️ Delete Chat", use_container_width=True, disabled=not sessions_meta):
                 sid_to_delete = sessions_meta[selected].get("session_id") if sessions_meta else None
                 if sid_to_delete:
                     delete_session(sid_to_delete)
