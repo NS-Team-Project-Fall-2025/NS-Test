@@ -1,9 +1,188 @@
 import streamlit as st
 import os
 from typing import List
+import re
+import base64
+import fitz  # PyMuPDF
+import docx
+import requests
+
+# --- Summarization helpers (module level) ---
+def handle_summarization_request(prompt: str):
+    """
+    Improved: Robust file matching, always returns summary + citation dict for chat history.
+    """
+    # Patterns for textbook and slides
+    page_pat = re.compile(r"summari[sz]e\s+page\s+(\d+)\s+from\s+([\w\d_\-\.]+)", re.I)
+    slide_pat = re.compile(r"summari[sz]e\s+slide(?:\s*no)?\s*(\d+)\s+from\s+lecture slides?\s*([\w\d_\-\.]+)", re.I)
+    m_page = page_pat.search(prompt)
+    m_slide = slide_pat.search(prompt)
+    kb_files = _get_kb_files()
+    if m_page:
+        page_num = int(m_page.group(1))
+        doc_name = m_page.group(2).lower()
+        # Try to match by index (e.g. 'textbook1' means first file)
+        files = kb_files.get("TEXTBOOKs", [])
+        file_path = None
+        if doc_name.startswith("textbook") and doc_name[8:].isdigit():
+            idx = int(doc_name[8:]) - 1
+            if 0 <= idx < len(files):
+                file_path = files[idx]
+        # Fallback: match by normalized name
+        if not file_path:
+            for f in files:
+                if doc_name in os.path.splitext(os.path.basename(f))[0].lower():
+                    file_path = f
+                    break
+        if not file_path:
+            return {"error": f"No textbook found matching '{doc_name}'."}
+        ext = os.path.splitext(file_path)[1].lower()
+        filename = os.path.basename(file_path)
+        if ext == ".pdf":
+            try:
+                doc = fitz.open(file_path)
+                if page_num < 1 or page_num > doc.page_count:
+                    return {"error": f"Page {page_num} out of range (1-{doc.page_count}) for {filename}."}
+                text = doc.load_page(page_num-1).get_text()
+            except Exception as e:
+                return {"error": f"Error reading PDF: {e}"}
+        elif ext == ".docx":
+            try:
+                doc = docx.Document(file_path)
+                text = "\n".join(p.text for p in doc.paragraphs)
+            except Exception as e:
+                return {"error": f"Error reading DOCX: {e}"}
+        elif ext == ".txt":
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read()
+            except Exception as e:
+                return {"error": f"Error reading TXT: {e}"}
+        else:
+            return {"error": f"Unsupported file type: {ext}"}
+        summary = ask_llm_summary(text, page_num, filename)
+        citation = {
+            "filename": filename,
+            "page_number": page_num,
+            "content_preview": text[:300] + ("..." if len(text) > 300 else "")
+        }
+        return {"summary": summary, "citation": citation}
+    elif m_slide:
+        slide_num = int(m_slide.group(1))
+        slide_name = m_slide.group(2).lower()
+        files = kb_files.get("LECTURE SLIDEs", [])
+        file_path = None
+        if slide_name.isdigit():
+            idx = int(slide_name) - 1
+            if 0 <= idx < len(files):
+                file_path = files[idx]
+        if not file_path:
+            for f in files:
+                if slide_name in os.path.splitext(os.path.basename(f))[0].lower():
+                    file_path = f
+                    break
+        if not file_path:
+            return {"error": f"No lecture slide found matching '{slide_name}'."}
+        ext = os.path.splitext(file_path)[1].lower()
+        filename = os.path.basename(file_path)
+        if ext == ".pdf":
+            try:
+                doc = fitz.open(file_path)
+                if slide_num < 1 or slide_num > doc.page_count:
+                    return {"error": f"Slide {slide_num} out of range (1-{doc.page_count}) for {filename}."}
+                text = doc.load_page(slide_num-1).get_text()
+            except Exception as e:
+                return {"error": f"Error reading PDF: {e}"}
+        elif ext == ".docx":
+            try:
+                doc = docx.Document(file_path)
+                text = "\n".join(p.text for p in doc.paragraphs)
+            except Exception as e:
+                return {"error": f"Error reading DOCX: {e}"}
+        elif ext == ".txt":
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read()
+            except Exception as e:
+                return {"error": f"Error reading TXT: {e}"}
+        else:
+            return {"error": f"Unsupported file type: {ext}"}
+        summary = ask_llm_summary(text, slide_num, filename, is_slide=True)
+        citation = {
+            "filename": filename,
+            "page_number": slide_num,
+            "content_preview": text[:300] + ("..." if len(text) > 300 else "")
+        }
+        return {"summary": summary, "citation": citation}
+    else:
+        return None
+
+def ask_llm_summary_stream(text, num, filename, is_slide=False):
+    """
+    Streams summary tokens from Ollama API (yields tokens as they arrive).
+    """
+    prompt = f"Summarize the following {'slide' if is_slide else 'page'} (number {num}) from {filename}:\n\n{text}\n\nSummary:"
+    url = f"{Config.OLLAMA_BASE_URL}/api/generate"
+    try:
+        with requests.post(
+            url,
+            json={
+                "model": Config.OLLAMA_MODEL,
+                "prompt": prompt,
+                "temperature": Config.OLLAMA_TEMPERATURE,
+                "stream": True
+            },
+            timeout=120,
+            stream=True
+        ) as resp:
+            if resp.status_code != 200:
+                yield {"type": "error", "text": f"LLM error: {resp.text}"}
+                return
+            buffer = ""
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                try:
+                    data = line.decode("utf-8")
+                    # Ollama streams JSON objects per line
+                    import json as _json
+                    obj = _json.loads(data)
+                    token = obj.get("response", "")
+                    if token:
+                        buffer += token
+                        yield {"type": "token", "text": token, "buffer": buffer}
+                    if obj.get("done"):
+                        break
+                except Exception:
+                    continue
+            yield {"type": "final", "text": buffer}
+    except Exception as e:
+        yield {"type": "error", "text": f"Error calling LLM: {e}"}
+
+def ask_llm_summary(text, num, filename, is_slide=False):
+    # Non-streaming fallback for summary
+    prompt = f"Summarize the following {'slide' if is_slide else 'page'} (number {num}) from {filename}:\n\n{text}\n\nSummary:"
+    try:
+        response = requests.post(
+            f"{Config.OLLAMA_BASE_URL}/api/generate",
+            json={
+                "model": Config.OLLAMA_MODEL,
+                "prompt": prompt,
+                "temperature": Config.OLLAMA_TEMPERATURE,
+                "stream": False
+            },
+            timeout=60
+        )
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("response", "[No summary returned]")
+        else:
+            return f"LLM error: {response.text}"
+    except Exception as e:
+        return f"Error calling LLM: {e}"
 from utils.document_processor import DocumentProcessor
 from utils.vector_store import VectorStore
-from utils.rag_chain import RAGChain
+from utils.rag_chain import RAGChain, CombinedRAGChain
 from utils.session_store import (
     list_sessions,
     load_session,
@@ -124,10 +303,17 @@ chatContainerObserver.observe(document.body, { childList: true, subtree: true })
 
 
 # ------------------ Initialize Session State ------------------
-if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore = None
-if "rag_chain" not in st.session_state:
-    st.session_state.rag_chain = None
+# Vectorstores for separate knowledge bases
+if "vectorstore_textbooks" not in st.session_state:
+    st.session_state.vectorstore_textbooks = None
+if "vectorstore_slides" not in st.session_state:
+    st.session_state.vectorstore_slides = None
+if "rag_chain_textbooks" not in st.session_state:
+    st.session_state.rag_chain_textbooks = None
+if "rag_chain_slides" not in st.session_state:
+    st.session_state.rag_chain_slides = None
+if "rag_chain_both" not in st.session_state:
+    st.session_state.rag_chain_both = None
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "documents_processed" not in st.session_state:
@@ -149,58 +335,96 @@ if "ignore_next_session_select" not in st.session_state:
     st.session_state.ignore_next_session_select = False
 
 # ------------------ Helpers ------------------
-def _get_kb_files() -> List[str]:
-    files = []
-    kb_dir = Config.DATA_DIR
-    try:
-        if os.path.isdir(kb_dir):
-            for name in sorted(os.listdir(kb_dir)):
-                path = os.path.join(kb_dir, name)
-                if os.path.isfile(path) and os.path.splitext(name)[1].lower() in {'.pdf', '.docx', '.txt'}:
-                    files.append(path)
-    except Exception:
-        pass
+def _get_kb_files() -> dict:
+    files = {"TEXTBOOKs": [], "LECTURE SLIDEs": []}
+    dirs = {
+        "TEXTBOOKs": getattr(Config, "DATA_DIR_TEXTBOOKS", Config.DATA_DIR),
+        "LECTURE SLIDEs": getattr(Config, "DATA_DIR_SLIDES", Config.DATA_DIR),
+    }
+    for label, kb_dir in dirs.items():
+        try:
+            if os.path.isdir(kb_dir):
+                for name in sorted(os.listdir(kb_dir)):
+                    path = os.path.join(kb_dir, name)
+                    if os.path.isfile(path) and os.path.splitext(name)[1].lower() in {'.pdf', '.docx', '.txt'}:
+                        files[label].append(path)
+        except Exception:
+            pass
     return files
 
 def _render_kb_listing():
-    files = _get_kb_files()
+    files_by_cat = _get_kb_files()
     st.subheader("📚 Knowledge Base Files")
-    if not files:
+    empty = not (files_by_cat.get("TEXTBOOKs") or files_by_cat.get("LECTURE SLIDEs"))
+    if empty:
         st.info("No documents in the knowledge base yet. Upload to get started.")
         return
-    for path in files:
-        name = os.path.basename(path)
-        size = os.path.getsize(path)
-        label = f"📄 {name} ({size/1024:.1f} KB)"
-        with st.expander(label):
-            try:
-                with open(path, 'rb') as fh:
-                    st.download_button("⬇️ Download", data=fh.read(), file_name=name, use_container_width=True)
-            except Exception:
-                st.warning("Download unavailable for this file.")
+    for cat_label, files in files_by_cat.items():
+        st.markdown(f"**{cat_label}**")
+        if not files:
+            st.caption("(no files)")
+            continue
+        for path in files:
+            name = os.path.basename(path)
+            size = os.path.getsize(path)
+            label = f"📄 {name} ({size/1024:.1f} KB)"
+            with st.expander(label):
+                try:
+                    with open(path, 'rb') as fh:
+                        st.download_button("⬇️ Download", data=fh.read(), file_name=name, use_container_width=True)
+                except Exception:
+                    st.warning("Download unavailable for this file.")
 
-            if st.button("👁️ View", key=f"view_{name}", use_container_width=True):
-                st.session_state.active_view_file = path
-                st.session_state.viewer_mode = True
-                st.rerun()
+                if st.button("👁️ View", key=f"view_{cat_label}_{name}", use_container_width=True):
+                    st.session_state.active_view_file = path
+                    st.session_state.viewer_mode = True
+                    st.rerun()
 
 
 def initialize_components():
-    if st.session_state.vectorstore is None:
-        st.session_state.vectorstore = VectorStore(
+    # Create both vector stores
+    if st.session_state.vectorstore_textbooks is None:
+        st.session_state.vectorstore_textbooks = VectorStore(
             embedding_model=Config.EMBEDDING_MODEL,
-            persist_directory=Config.VECTOR_STORE_DIR
+            persist_directory=getattr(Config, "VECTOR_STORE_DIR_TEXTBOOKS", Config.VECTOR_STORE_DIR)
         )
         try:
-            loaded = st.session_state.vectorstore.load_vectorstore()
+            loaded = st.session_state.vectorstore_textbooks.load_vectorstore()
             if loaded:
-                info = st.session_state.vectorstore.get_collection_info()
+                info = st.session_state.vectorstore_textbooks.get_collection_info()
                 if info.get("count", 0) > 0:
                     st.session_state.documents_processed = True
         except Exception:
             pass
-    if st.session_state.rag_chain is None:
-        st.session_state.rag_chain = RAGChain(st.session_state.vectorstore)
+    if st.session_state.vectorstore_slides is None:
+        st.session_state.vectorstore_slides = VectorStore(
+            embedding_model=Config.EMBEDDING_MODEL,
+            persist_directory=getattr(Config, "VECTOR_STORE_DIR_SLIDES", Config.VECTOR_STORE_DIR)
+        )
+        try:
+            loaded = st.session_state.vectorstore_slides.load_vectorstore()
+            if loaded:
+                info = st.session_state.vectorstore_slides.get_collection_info()
+                if info.get("count", 0) > 0:
+                    st.session_state.documents_processed = True
+        except Exception:
+            pass
+
+    # Initialize RAG chains for each store
+    if st.session_state.rag_chain_textbooks is None and st.session_state.vectorstore_textbooks is not None:
+        st.session_state.rag_chain_textbooks = RAGChain(st.session_state.vectorstore_textbooks)
+    if st.session_state.rag_chain_slides is None and st.session_state.vectorstore_slides is not None:
+        st.session_state.rag_chain_slides = RAGChain(st.session_state.vectorstore_slides)
+    # Initialize combined RAG if possible
+    if (
+        st.session_state.rag_chain_both is None and 
+        (st.session_state.vectorstore_textbooks is not None or st.session_state.vectorstore_slides is not None)
+    ):
+        stores = [s for s in [st.session_state.vectorstore_textbooks, st.session_state.vectorstore_slides] if s is not None]
+        st.session_state.rag_chain_both = CombinedRAGChain(stores)
+
+    # Default selections for upload and query categories
+    st.session_state.setdefault("query_kb", "TEXTBOOKs")
 
 # --- PDF/DOCX/TXT viewer utilities ---
 def display_pdf(file_path: str, height: int = 820) -> bool:
@@ -305,6 +529,13 @@ def main():
     # Sidebar
     with st.sidebar:
         st.header("📂 Document Management")
+        # Upload category selection
+        st.session_state.upload_category = st.radio(
+            "Upload to knowledge base:",
+            options=["TEXTBOOKs", "LECTURE SLIDEs"],
+            index=0 if st.session_state.get("upload_category") == "TEXTBOOKs" else 1,
+            horizontal=True,
+        )
         uploaded_files = st.file_uploader(
             "Upload Documents",
             type=['pdf', 'docx', 'txt'],
@@ -327,7 +558,7 @@ def main():
                     unique_files.append(f); seen.add(f.name)
             uploaded_files = unique_files
         if uploaded_files and st.button("🚀 Process Documents", use_container_width=True):
-            process_documents(uploaded_files)
+            process_documents(uploaded_files, st.session_state.upload_category)
 
         st.divider()
         _render_kb_listing()
@@ -338,6 +569,16 @@ def main():
             st.session_state.setdefault("show_context", False)
             st.session_state.show_sources = st.checkbox("Show sources", value=st.session_state.show_sources)
             st.session_state.show_context = st.checkbox("Show context", value=st.session_state.show_context)
+            st.session_state.query_kb = st.radio(
+                "Use knowledge base:",
+                options=["TEXTBOOKs", "LECTURE SLIDEs", "BOTH"],
+                index=(
+                    0 if st.session_state.get("query_kb") == "TEXTBOOKs" else 
+                    (1 if st.session_state.get("query_kb") == "LECTURE SLIDEs" else 2)
+                ),
+                horizontal=True,
+                help="Choose which vector DB to retrieve from when answering."
+            )
 
         if st.button("🗑 Clear Knowledge Base", use_container_width=True):
             clear_knowledge_base()
@@ -392,8 +633,13 @@ def main():
                         if st.session_state.get("show_sources", True) and entry.get("sources"):
                             st.markdown("**Sources**")
                             for i, source in enumerate(entry.get("sources", []), 1):
-                                with st.expander(f"📄 Source {i}: {source.get('filename', 'unknown')}"):
+                                page = source.get('page_number')
+                                url = source.get('url')
+                                title = f"📄 Source {i}: {source.get('filename', 'unknown')}{f' — page {page}' if page else ''}"
+                                with st.expander(title):
                                     st.text(source.get('content_preview', ''))
+                                    if url:
+                                        st.markdown(f"[Open in viewer (page {page})]({url})", unsafe_allow_html=True)
                         if st.session_state.get("show_context", False) and entry.get("context"):
                             with st.expander("🔍 Retrieved Context"):
                                 st.text_area("Context used for answering:", entry.get("context", ""), height=200)
@@ -406,7 +652,9 @@ def main():
                     if st.session_state.get("show_sources", True) and entry.get("sources"):
                         st.markdown("**Sources**")
                         for i, source in enumerate(entry.get("sources", []), 1):
-                            with st.expander(f"📄 Source {i}: {source.get('filename', 'unknown')}"):
+                            page = source.get('page_number')
+                            title = f"📄 Source {i}: {source.get('filename', 'unknown')}{f' — page {page}' if page else ''}"
+                            with st.expander(title):
                                 st.text(source.get('content_preview', ''))
             else:
                 # Unknown format fallback
@@ -416,72 +664,157 @@ def main():
         # Chat input at bottom
         prompt = st.chat_input("Ask Anything related to Network Security Course...")
         if prompt is not None:
-            if not st.session_state.documents_processed:
-                st.warning("Please upload and process documents before asking questions.", icon="⚠️")
-            elif not prompt.strip():
-                st.warning("Please enter a message.", icon="⚠️")
-            elif not st.session_state.rag_chain:
-                st.error("Unexpected error: RAG chain not initialized.")
+            # Check for summarization request first
+            summary_result = handle_summarization_request(prompt)
+            is_summary = isinstance(summary_result, dict) and ("summary" in summary_result or "error" in summary_result)
+            # Always append user message to chat history
+            st.session_state.chat_history.append({"role": "user", "content": prompt})
+            # Persist after user message; if first message of a new chat, create a new chat session
+            if st.session_state.get("session_id"):
+                try:
+                    save_session(st.session_state.session_id, st.session_state.chat_history, st.session_state.get("session_title"))
+                except Exception:
+                    pass
             else:
-                # Appending user message
-                st.session_state.chat_history.append({"role": "user", "content": prompt})
-                # Persist after user message; if first message of a new chat, create a new chat session
-                if st.session_state.get("session_id"):
-                    try:
-                        save_session(st.session_state.session_id, st.session_state.chat_history, st.session_state.get("session_title"))
-                    except Exception:
-                        pass
+                try:
+                    import uuid as _uuid
+                    from datetime import datetime as _dt
+                    now = _dt.now()
+                    time_str = now.strftime("%H:%M")
+                    date_str = now.strftime("%Y-%m-%d")
+                    new_sid = str(_uuid.uuid4())
+                    short_sid = new_sid[:8]
+                    title = f"{time_str} {date_str} — {short_sid}"
+                    save_session(new_sid, st.session_state.chat_history, title)
+                    st.session_state.session_id = new_sid
+                    st.session_state.session_title = title
+                except Exception:
+                    pass
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            # Summarization: treat as normal assistant message with sources
+            if is_summary:
+                if "error" in summary_result:
+                    with st.chat_message("assistant"):
+                        st.error(summary_result["error"])
                 else:
-                    try:
-                        # Create new session id and title: Time followed by date and a session ID
-                        import uuid as _uuid
-                        from datetime import datetime as _dt
-                        now = _dt.now()
-                        time_str = now.strftime("%H:%M")
-                        date_str = now.strftime("%Y-%m-%d")
-                        new_sid = str(_uuid.uuid4())
-                        short_sid = new_sid[:8]
-                        title = f"{time_str} {date_str} — {short_sid}"
-                        save_session(new_sid, st.session_state.chat_history, title)
-                        st.session_state.session_id = new_sid
-                        st.session_state.session_title = title
-                    except Exception:
-                        pass
-                with st.chat_message("user"):
-                    st.markdown(prompt)
-
-                # Generate assistant reply using RAG context history
-                with st.chat_message("assistant"):
-                    with st.spinner("🤔 Thinking..."):
-                        result = st.session_state.rag_chain.chat_with_context(prompt, chat_history=st.session_state.chat_history)
-                    answer = result.get("answer", "")
-                    st.markdown(answer)
-
-                    # Append assistant message with required metadata
-                    assistant_entry = {
+                    # Streaming summary from Ollama
+                    with st.chat_message("assistant"):
+                        placeholder = st.empty()
+                        buffer = ""
+                        for event in ask_llm_summary_stream(
+                            summary_result["citation"]["content_preview"] + "...",  # Use preview as text for streaming (for demo, ideally use full text)
+                            summary_result["citation"]["page_number"],
+                            summary_result["citation"]["filename"],
+                            is_slide="slide" in prompt.lower()
+                        ):
+                            if event["type"] == "token":
+                                buffer += event["text"]
+                                placeholder.markdown(buffer)
+                            elif event["type"] == "final":
+                                buffer = event["text"]
+                                placeholder.markdown(buffer)
+                            elif event["type"] == "error":
+                                st.error(event["text"])
+                        # Optionally render sources/citations inline
+                        if st.session_state.get("show_sources", True):
+                            st.markdown("**Sources**")
+                            citation = summary_result["citation"]
+                            page = citation.get('page_number')
+                            url = citation.get('url')
+                            title = f"📄 Source: {citation.get('filename', 'unknown')}{f' — page {page}' if page else ''}"
+                            with st.expander(title):
+                                st.text(citation.get('content_preview', ''))
+                                if url:
+                                    st.markdown(f"[Open in viewer (page {page})]({url})", unsafe_allow_html=True)
+                    # Store as assistant message with sources
+                    st.session_state.chat_history.append({
                         "role": "assistant",
-                        "content": answer,
-                        "sources": result.get("sources", []),
-                        "context": result.get("context", "")
-                    }
-                    st.session_state.chat_history.append(assistant_entry)
-
-                    # Persist session after each of the assistant reply
+                        "content": buffer,
+                        "sources": [summary_result["citation"]],
+                        "context": "",
+                        "kb_used": "SUMMARY"
+                    })
                     if st.session_state.get("session_id"):
                         try:
                             save_session(st.session_state.session_id, st.session_state.chat_history, st.session_state.get("session_title"))
                         except Exception:
                             pass
+            else:
+                if not st.session_state.documents_processed:
+                    st.warning("Please upload and process documents before asking questions.", icon="⚠️")
+                elif not prompt.strip():
+                    st.warning("Please enter a message.", icon="⚠️")
+                elif not (st.session_state.rag_chain_textbooks or st.session_state.rag_chain_slides):
+                    st.error("Unexpected error: RAG chains not initialized.")
+                else:
+                    # Generate assistant reply using RAG context history
+                    with st.chat_message("assistant"):
+                        with st.spinner("🤔 Thinking..."):
+                            selected_kb = st.session_state.get("query_kb")
+                            if selected_kb == "BOTH":
+                                active_rag = st.session_state.rag_chain_both or st.session_state.rag_chain_textbooks or st.session_state.rag_chain_slides
+                            elif selected_kb == "LECTURE SLIDEs":
+                                active_rag = st.session_state.rag_chain_slides
+                            else:
+                                active_rag = st.session_state.rag_chain_textbooks
+                            # Stream the response token-by-token (fallback to non-streaming if unavailable)
+                            if hasattr(active_rag, "chat_with_context_stream"):
+                                placeholder = st.empty()
+                                buffer = ""
+                                result_final = None
+                                try:
+                                    for event in active_rag.chat_with_context_stream(prompt, chat_history=st.session_state.chat_history):
+                                        if event.get("type") == "token":
+                                            buffer += event.get("text", "")
+                                            placeholder.markdown(buffer)
+                                        elif event.get("type") == "final":
+                                            result_final = event
+                                    result = result_final or {"answer": buffer, "sources": [], "context": ""}
+                                except Exception:
+                                    # In case streaming fails mid-way, fall back
+                                    result = active_rag.chat_with_context(prompt, chat_history=st.session_state.chat_history)
+                            else:
+                                result = active_rag.chat_with_context(prompt, chat_history=st.session_state.chat_history)
+                        answer = result.get("answer", "")
+                        # Ensure final rendered answer remains
+                        st.markdown(answer)
 
-                    # Optionally render sources/context inline
-                    if st.session_state.get("show_sources", True) and assistant_entry["sources"]:
-                        st.markdown("**Sources**")
-                        for i, source in enumerate(assistant_entry["sources"], 1):
-                            with st.expander(f"📄 Source {i}: {source.get('filename', 'unknown')}"):
-                                st.text(source.get('content_preview', ''))
-                    if st.session_state.get("show_context", False) and assistant_entry.get("context"):
-                        with st.expander("🔍 Retrieved Context"):
-                            st.text_area("Context used for answering:", assistant_entry.get("context", ""), height=200)
+                        # Append assistant message with required metadata
+                        assistant_entry = {
+                            "role": "assistant",
+                            "content": answer,
+                            "sources": result.get("sources", []),
+                            "context": result.get("context", ""),
+                            "kb_used": st.session_state.get("query_kb")
+                        }
+                        st.session_state.chat_history.append(assistant_entry)
+
+                        # Persist session after each of the assistant reply
+                        if st.session_state.get("session_id"):
+                            try:
+                                save_session(st.session_state.session_id, st.session_state.chat_history, st.session_state.get("session_title"))
+                            except Exception:
+                                pass
+
+                        # Optionally render sources/context inline
+                        if st.session_state.get("show_sources", True) and assistant_entry["sources"]:
+                            # Only show sources with valid filename and content_preview
+                            filtered_sources = [s for s in assistant_entry["sources"] if s.get("filename") and s.get("content_preview")]
+                            if filtered_sources:
+                                st.markdown("**Sources**")
+                                for i, source in enumerate(filtered_sources, 1):
+                                    page = source.get('page_number')
+                                    url = source.get('url')
+                                    title = f"📄 Source {i}: {source.get('filename', 'unknown')}{f' — page {page}' if page else ''}"
+                                    with st.expander(title):
+                                        st.text(source.get('content_preview', ''))
+                                        if url:
+                                            st.markdown(f"[Open in viewer (page {page})]({url})", unsafe_allow_html=True)
+                        if st.session_state.get("show_context", False) and assistant_entry.get("context"):
+                            with st.expander("🔍 Retrieved Context"):
+                                st.text_area("Context used for answering:", assistant_entry.get("context", ""), height=200)
 
     with col2:
         st.subheader("⏱ Chat History")
@@ -563,13 +896,21 @@ def main():
 
 
 # ------------------ Core Functions ------------------
-def process_documents(uploaded_files):
+def process_documents(uploaded_files, category: str):
     try:
         with st.spinner("⏳ Processing documents..."):
-            os.makedirs(Config.DATA_DIR, exist_ok=True)
+            # Choose directories and vector store by category
+            if category == "LECTURE SLIDEs":
+                data_dir = getattr(Config, "DATA_DIR_SLIDES", Config.DATA_DIR)
+                vstore = st.session_state.vectorstore_slides
+            else:
+                data_dir = getattr(Config, "DATA_DIR_TEXTBOOKS", Config.DATA_DIR)
+                vstore = st.session_state.vectorstore_textbooks
+
+            os.makedirs(data_dir, exist_ok=True)
             file_paths = []
             for uploaded_file in uploaded_files:
-                file_path = os.path.join(Config.DATA_DIR, uploaded_file.name)
+                file_path = os.path.join(data_dir, uploaded_file.name)
                 with open(file_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
                 file_paths.append(file_path)
@@ -578,8 +919,8 @@ def process_documents(uploaded_files):
                 chunk_overlap=Config.CHUNK_OVERLAP
             )
             documents = processor.process_multiple_documents(file_paths)
-            if documents:
-                st.session_state.vectorstore.add_documents(documents)
+            if documents and vstore is not None:
+                vstore.add_documents(documents)
                 st.session_state.documents_processed = True
                 st.success("✅ Successfully processed document(s). You can now ask questions!", icon="🎉")
             else:
@@ -589,8 +930,19 @@ def process_documents(uploaded_files):
 
 def ask_question(question: str, show_sources: bool, show_context: bool):
     try:
+        # Route to appropriate RAG chain based on selected KB
+        selected_kb = st.session_state.get("query_kb")
+        if selected_kb == "BOTH":
+            rag = st.session_state.rag_chain_both or st.session_state.rag_chain_textbooks or st.session_state.rag_chain_slides
+        elif selected_kb == "LECTURE SLIDEs":
+            rag = st.session_state.rag_chain_slides
+        else:
+            rag = st.session_state.rag_chain_textbooks
+        if rag is None:
+            st.error("Selected knowledge base is not initialized.")
+            return
         with st.spinner("🤔 Thinking..."):
-            result = st.session_state.rag_chain.generate_answer(question)
+            result = rag.chat_with_context(question, chat_history=st.session_state.chat_history)
         st.markdown("### 🧠 Answer")
         st.info(result["answer"])
         st.session_state.chat_history.append({
@@ -601,8 +953,13 @@ def ask_question(question: str, show_sources: bool, show_context: bool):
         if show_sources and result.get("sources"):
             st.markdown("### 📚 Sources")
             for i, source in enumerate(result["sources"], 1):
-                with st.expander(f"📄 Source {i}: {source.get('filename', 'unknown')}"):
+                page = source.get('page_number')
+                url = source.get('url')
+                title = f"📄 Source {i}: {source.get('filename', 'unknown')}{f' — page {page}' if page else ''}"
+                with st.expander(title):
                     st.text(source.get('content_preview', ''))
+                    if url:
+                        st.markdown(f"[Open in viewer (page {page})]({url})", unsafe_allow_html=True)
         if show_context and result.get("context"):
             with st.expander("🔍 Retrieved Context"):
                 st.text_area("Context used for answering:", result["context"], height=200)
@@ -649,13 +1006,43 @@ def display_chat_history():
                 st.write("**A:**", a)
 
 def clear_knowledge_base():
-    if st.session_state.vectorstore:
-        st.session_state.vectorstore.delete_collection()
-        st.session_state.vectorstore = None
-        st.session_state.rag_chain = None
-        st.session_state.documents_processed = False
-        st.success("🧹 Knowledge base cleared!")
-        st.rerun()
+    # Delete both vector store collections
+    try:
+        if st.session_state.vectorstore_textbooks:
+            st.session_state.vectorstore_textbooks.delete_collection()
+            st.session_state.vectorstore_textbooks = None
+            st.session_state.rag_chain_textbooks = None
+        if st.session_state.vectorstore_slides:
+            st.session_state.vectorstore_slides.delete_collection()
+            st.session_state.vectorstore_slides = None
+            st.session_state.rag_chain_slides = None
+        # Reset combined chain
+        st.session_state.rag_chain_both = None
+    except Exception as e:
+        st.warning(f"Error clearing vector stores: {e}")
+
+    # Remove files in data directories (including legacy DATA_DIR)
+    dirs = set([
+        getattr(Config, "DATA_DIR_TEXTBOOKS", Config.DATA_DIR),
+        getattr(Config, "DATA_DIR_SLIDES", Config.DATA_DIR),
+        getattr(Config, "DATA_DIR", "data/documents")
+    ])
+    for d in dirs:
+        try:
+            if os.path.isdir(d):
+                for name in os.listdir(d):
+                    path = os.path.join(d, name)
+                    if os.path.isfile(path):
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    st.session_state.documents_processed = False
+    st.success("🧹 Knowledge base (vectors + files) cleared!")
+    st.rerun()
 
 # ------------------ Run App ------------------
 if __name__ == "__main__":

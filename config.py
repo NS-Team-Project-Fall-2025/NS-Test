@@ -17,13 +17,18 @@ class Config:
     CHUNK_SIZE = 1000
     CHUNK_OVERLAP = 200
     
-    # Directories
+    # Directories (legacy single-dir for backward compatibility)
     DATA_DIR = "data/documents"
     VECTOR_STORE_DIR = "vectorstore"
     
+    # New separated knowledge base directories
+    DATA_DIR_TEXTBOOKS = "data/textbooks"
+    DATA_DIR_SLIDES = "data/slides"
+    VECTOR_STORE_DIR_TEXTBOOKS = "vectorstore/textbooks"
+    VECTOR_STORE_DIR_SLIDES = "vectorstore/slides"
+    
     # Streamlit Configuration
     PAGE_TITLE = "NetSec-Tutor"
-
     PAGE_ICON = "🤖"
 
 
