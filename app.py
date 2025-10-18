@@ -7,6 +7,57 @@ import fitz  # PyMuPDF
 import docx
 import requests
 
+def inject_fixed_header():
+    st.markdown("""
+    <style>
+    div[data-testid="stToolbar"] {visibility: hidden;}
+    div[data-testid="stDecoration"] {visibility: hidden;}
+    div[data-testid="stStatusWidget"] {visibility: hidden;}
+    #MainMenu {visibility: hidden;}
+    header {visibility: hidden;}
+
+    /* ---- Fixed header ---- */
+    .netsec-fixed-header {
+        position: fixed !important;
+        top: 0;
+        left: 0;
+        width: 100%;
+        background: #0e1117;
+        text-align: center;
+        z-index: 999999;
+        border-bottom: 1px solid rgba(255,255,255,0.15);
+        padding: 18px 0 12px 0;
+    }
+
+    .netsec-fixed-header h1 {
+        color: white !important;
+        font-weight: 800;
+        font-size: 32px;
+        margin-bottom: 4px;
+        letter-spacing: 0.5px;
+        font-family: "Segoe UI", sans-serif;
+    }
+
+    .netsec-fixed-header p {
+        color: #ccc !important;
+        font-size: 17px;
+        margin: 0;
+        opacity: 0.85;
+    }
+
+    /* Prevent overlap with header */
+    [data-testid="stAppViewContainer"] .block-container {
+        padding-top: 120px !important;
+    }
+    </style>
+
+    <div class="netsec-fixed-header">
+        <h1>🔐 NetSec Tutor</h1>
+        <p>An easy way to study and test your network security skills…</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+
 # --- Summarization helpers (module level) ---
 def handle_summarization_request(prompt: str):
     """
@@ -64,7 +115,8 @@ def handle_summarization_request(prompt: str):
         citation = {
             "filename": filename,
             "page_number": page_num,
-            "content_preview": text[:300] + ("..." if len(text) > 300 else "")
+            "content_preview": text[:300] + ("..." if len(text) > 300 else ""),
+            "full_text": text
         }
         return {"summary": summary, "citation": citation}
     elif m_slide:
@@ -111,7 +163,8 @@ def handle_summarization_request(prompt: str):
         citation = {
             "filename": filename,
             "page_number": slide_num,
-            "content_preview": text[:300] + ("..." if len(text) > 300 else "")
+            "content_preview": text[:300] + ("..." if len(text) > 300 else ""),
+            "full_text": text
         }
         return {"summary": summary, "citation": citation}
     else:
@@ -208,33 +261,6 @@ html, body, [class*="css"] {
     overflow: hidden; /* prevent whole-page scroll */
 }
 
-/* ===== Fixed Header ===== */
-.header-container {
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    text-align: center;
-    background: var(--background-color, #0e1117);
-    z-index: 1001;
-    padding: 20px 0 15px 0;
-    border-bottom: 1px solid rgba(128,128,128,0.2);
-}
-
-.header-container .main-title {
-    color: var(--text-color, #fff);
-    font-size: 36px;
-    font-weight: 700;
-    margin-bottom: 4px;
-}
-
-.header-container .subheader {
-    font-size: 18px;
-    color: var(--text-color, #ccc);
-    opacity: 0.8;
-    margin: 0;
-}
-
 /* ===== Layout adjustments ===== */
 [data-testid="stAppViewContainer"] .block-container {
     padding-top: 120px !important; /* Space for header */
@@ -318,12 +344,6 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "documents_processed" not in st.session_state:
     st.session_state.documents_processed = False
-if "active_view_file" not in st.session_state:
-    st.session_state.active_view_file = None
-if "viewer_mode" not in st.session_state:
-    st.session_state.viewer_mode = False
-if "active_view_page" not in st.session_state:
-    st.session_state.active_view_page = None
 # Chat session persistence
 if "session_id" not in st.session_state:
     st.session_state.session_id = None
@@ -375,10 +395,12 @@ def _render_kb_listing():
                 except Exception:
                     st.warning("Download unavailable for this file.")
 
-                if st.button("👁️ View", key=f"view_{cat_label}_{name}", use_container_width=True):
-                    st.session_state.active_view_file = path
-                    st.session_state.viewer_mode = True
-                    st.rerun()
+                # View button copies the file path to clipboard
+                file_path = os.path.abspath(path)
+                view_btn = st.button("👁️ Copy Path", key=f"view_{cat_label}_{name}", use_container_width=True)
+                if view_btn:
+                    st.code(file_path, language="text")
+                    st.success("File path copied! Use your system's copy shortcut if needed.")
 
 
 def initialize_components():
@@ -426,76 +448,11 @@ def initialize_components():
     # Default selections for upload and query categories
     st.session_state.setdefault("query_kb", "TEXTBOOKs")
 
-# --- PDF/DOCX/TXT viewer utilities ---
-def display_pdf(file_path: str, height: int = 820) -> bool:
-    """
-    Try 3 ways to display the PDF.
-    Returns True if something was rendered; False otherwise.
-    """
-    # streamlit-pdf-viewer
-    try:
-        from streamlit_pdf_viewer import pdf_viewer
-        with open(file_path, "rb") as f:
-            pdf_bytes = f.read()
-        pdf_viewer(input=pdf_bytes, width=0, height=height)  # width=0 makes it responsive
-        return True
-    except Exception:
-        pass
 
-    #Fallback: base64 iframe (works widely)
-    try:
-        import base64
-        from streamlit.components.v1 import html as st_html
-        with open(file_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
-        st_html(
-            f'<iframe src="data:application/pdf;base64,{b64}" '
-            f'width="100%" height="{height}px" style="border:none;border-radius:10px;"></iframe>',
-            height=height + 20,
-        )
-        return True
-    except Exception:
-        pass
-
-    # render page images with PyMuPDF
-    try:
-        import fitz  # PyMuPDF
-        doc = fitz.open(file_path)
-        total = doc.page_count
-        col_left, col_right = st.columns([9, 3])
-        with col_left:
-            page = st.number_input("Page", min_value=1, max_value=total, value=1, step=1)
-        with col_right:
-            zoom = st.slider("Zoom", 100, 300, 200, step=25, help="Image scale (fallback viewer)")
-        mat = fitz.Matrix(zoom/100.0, zoom/100.0)
-        pix = doc.load_page(page-1).get_pixmap(matrix=mat, alpha=False)
-        st.image(pix.tobytes("png"), use_container_width=True)
-        st.caption(f"Page {page} of {total} — image preview (PDF fallback).")
-        return True
-    except Exception as e:
-        st.error(f"Unable to render PDF: {e}")
-        return False
-
-def display_text_file(path: str):
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            st.text_area("Preview", f.read(), height=800)
-    except Exception as e:
-        st.warning(f"Unable to preview file: {e}")
-
-def display_docx_file(path: str):
-    try:
-        import docx
-        doc = docx.Document(path)
-        text = "\n".join(p.text for p in doc.paragraphs)
-        st.text_area("Preview", text, height=800)
-    except Exception as e:
-        st.warning(f"Unable to preview DOCX: {e}")
 
 # ------------------ Main UI ------------------
 def main():
-    st.markdown('<h1 class="main-title">NetSec Tutor</h1>', unsafe_allow_html=True)
-    st.markdown('<p class="subheader">An easy way to study and test your network security skills...</p>', unsafe_allow_html=True)
+    inject_fixed_header()
 
     # Checking Ollama availability
     try:
@@ -583,37 +540,6 @@ def main():
         if st.button("🗑 Clear Knowledge Base", use_container_width=True):
             clear_knowledge_base()
 
-    # ---------- Viewer Mode (full width) ----------
-    if st.session_state.viewer_mode and st.session_state.active_view_file:
-        path = st.session_state.active_view_file
-        if os.path.exists(path):
-            filename = os.path.basename(path)
-            # Top row: title (left) and close button (right)
-            left, right = st.columns([8, 1])
-            with left:
-                st.subheader(f"👁️ Viewer: {filename}")
-            with right:
-                if st.button("Close ✖", key="close_viewer", use_container_width=True):
-                    st.session_state.viewer_mode = False
-                    st.session_state.active_view_file = None
-                    st.rerun()
-
-            st.markdown('<div class="viewer-container">', unsafe_allow_html=True)
-            ext = os.path.splitext(filename)[1].lower()
-            if ext == ".pdf":
-                displayed = display_pdf(path, height=820)
-                if not displayed:
-                    st.info("If you see nothing, install `streamlit-pdf-viewer` or `pymupdf` for robust rendering.")
-            elif ext == ".txt":
-                display_text_file(path)
-            elif ext == ".docx":
-                display_docx_file(path)
-            else:
-                st.info("Viewer supports PDF, DOCX, and TXT.")
-            st.markdown('</div>', unsafe_allow_html=True)
-        else:
-            st.warning("Selected file no longer exists.")
-        return  # don't render chat while in viewer
 
     # ---------- Normal Chat Layout (ChatGPT-like) ----------
     col1, col2 = st.columns([2, 1])
@@ -664,12 +590,24 @@ def main():
         # Chat input at bottom
         prompt = st.chat_input("Ask Anything related to Network Security Course...")
         if prompt is not None:
-            # Check for summarization request first
-            summary_result = handle_summarization_request(prompt)
-            is_summary = isinstance(summary_result, dict) and ("summary" in summary_result or "error" in summary_result)
-            # Always append user message to chat history
+            # Instantly show user message in chat window
+            with st.chat_message("user"):
+                st.markdown(prompt)
             st.session_state.chat_history.append({"role": "user", "content": prompt})
-            # Persist after user message; if first message of a new chat, create a new chat session
+
+            # Add temporary assistant message for 'Assistant is thinking...'
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "content": "Assistant is thinking...",
+                "sources": [],
+                "context": "",
+                "kb_used": "TEMP"
+            })
+            
+            
+
+
+            # Persist after user message and temp assistant message
             if st.session_state.get("session_id"):
                 try:
                     save_session(st.session_state.session_id, st.session_state.chat_history, st.session_state.get("session_title"))
@@ -690,37 +628,52 @@ def main():
                     st.session_state.session_title = title
                 except Exception:
                     pass
-            with st.chat_message("user"):
-                st.markdown(prompt)
 
+            # Now process the query (summary or normal)
+            summary_result = handle_summarization_request(prompt)
+            is_summary = isinstance(summary_result, dict) and ("summary" in summary_result or "error" in summary_result)
             # Summarization: treat as normal assistant message with sources
             if is_summary:
                 if "error" in summary_result:
                     with st.chat_message("assistant"):
                         st.error(summary_result["error"])
                 else:
-                    # Streaming summary from Ollama
+                    # Streaming summary from Ollama, match RAG streaming UI
                     with st.chat_message("assistant"):
                         placeholder = st.empty()
                         buffer = ""
-                        for event in ask_llm_summary_stream(
-                            summary_result["citation"]["content_preview"] + "...",  # Use preview as text for streaming (for demo, ideally use full text)
-                            summary_result["citation"]["page_number"],
-                            summary_result["citation"]["filename"],
+                        citation = summary_result["citation"]
+                        stream_gen = ask_llm_summary_stream(
+                            citation.get("full_text", citation["content_preview"]),
+                            citation["page_number"],
+                            citation["filename"],
                             is_slide="slide" in prompt.lower()
-                        ):
+                        )
+                        result_final = None
+                        first_token = True
+                        for event in stream_gen:
                             if event["type"] == "token":
                                 buffer += event["text"]
                                 placeholder.markdown(buffer)
+                                if first_token:
+                                    # Update the temporary assistant message in chat_history
+                                    st.session_state.chat_history[-1] = {
+                                        "role": "assistant",
+                                        "content": buffer,
+                                        "sources": [citation],
+                                        "context": "",
+                                        "kb_used": "SUMMARY"
+                                    }
+                                    first_token = False
                             elif event["type"] == "final":
                                 buffer = event["text"]
                                 placeholder.markdown(buffer)
+                                result_final = buffer
                             elif event["type"] == "error":
                                 st.error(event["text"])
                         # Optionally render sources/citations inline
                         if st.session_state.get("show_sources", True):
                             st.markdown("**Sources**")
-                            citation = summary_result["citation"]
                             page = citation.get('page_number')
                             url = citation.get('url')
                             title = f"📄 Source: {citation.get('filename', 'unknown')}{f' — page {page}' if page else ''}"
@@ -728,14 +681,14 @@ def main():
                                 st.text(citation.get('content_preview', ''))
                                 if url:
                                     st.markdown(f"[Open in viewer (page {page})]({url})", unsafe_allow_html=True)
-                    # Store as assistant message with sources
-                    st.session_state.chat_history.append({
+                    # Store as assistant message with sources after streaming is complete
+                    st.session_state.chat_history[-1] = {
                         "role": "assistant",
-                        "content": buffer,
-                        "sources": [summary_result["citation"]],
+                        "content": result_final or buffer,
+                        "sources": [citation],
                         "context": "",
                         "kb_used": "SUMMARY"
-                    })
+                    }
                     if st.session_state.get("session_id"):
                         try:
                             save_session(st.session_state.session_id, st.session_state.chat_history, st.session_state.get("session_title"))
@@ -764,11 +717,22 @@ def main():
                                 placeholder = st.empty()
                                 buffer = ""
                                 result_final = None
+                                first_token = True
                                 try:
                                     for event in active_rag.chat_with_context_stream(prompt, chat_history=st.session_state.chat_history):
                                         if event.get("type") == "token":
                                             buffer += event.get("text", "")
                                             placeholder.markdown(buffer)
+                                            if first_token:
+                                                # Update the temporary assistant message in chat_history
+                                                st.session_state.chat_history[-1] = {
+                                                    "role": "assistant",
+                                                    "content": buffer,
+                                                    "sources": event.get("sources", []),
+                                                    "context": event.get("context", ""),
+                                                    "kb_used": st.session_state.get("query_kb")
+                                                }
+                                                first_token = False
                                         elif event.get("type") == "final":
                                             result_final = event
                                     result = result_final or {"answer": buffer, "sources": [], "context": ""}
@@ -781,15 +745,14 @@ def main():
                         # Ensure final rendered answer remains
                         st.markdown(answer)
 
-                        # Append assistant message with required metadata
-                        assistant_entry = {
+                        # Update the temporary assistant message in chat_history with the final answer
+                        st.session_state.chat_history[-1] = {
                             "role": "assistant",
                             "content": answer,
                             "sources": result.get("sources", []),
                             "context": result.get("context", ""),
                             "kb_used": st.session_state.get("query_kb")
                         }
-                        st.session_state.chat_history.append(assistant_entry)
 
                         # Persist session after each of the assistant reply
                         if st.session_state.get("session_id"):
@@ -799,9 +762,9 @@ def main():
                                 pass
 
                         # Optionally render sources/context inline
-                        if st.session_state.get("show_sources", True) and assistant_entry["sources"]:
+                        if st.session_state.get("show_sources", True) and result.get("sources", []):
                             # Only show sources with valid filename and content_preview
-                            filtered_sources = [s for s in assistant_entry["sources"] if s.get("filename") and s.get("content_preview")]
+                            filtered_sources = [s for s in result.get("sources", []) if s.get("filename") and s.get("content_preview")]
                             if filtered_sources:
                                 st.markdown("**Sources**")
                                 for i, source in enumerate(filtered_sources, 1):
@@ -812,9 +775,9 @@ def main():
                                         st.text(source.get('content_preview', ''))
                                         if url:
                                             st.markdown(f"[Open in viewer (page {page})]({url})", unsafe_allow_html=True)
-                        if st.session_state.get("show_context", False) and assistant_entry.get("context"):
+                        if st.session_state.get("show_context", False) and result.get("context", ""):
                             with st.expander("🔍 Retrieved Context"):
-                                st.text_area("Context used for answering:", assistant_entry.get("context", ""), height=200)
+                                st.text_area("Context used for answering:", result.get("context", ""), height=200)
 
     with col2:
         st.subheader("⏱ Chat History")
@@ -887,12 +850,8 @@ def main():
             file_name = os.path.basename(active_file)
             ext = os.path.splitext(file_name)[1].lower()
             st.subheader(f"👁️ Viewer: {file_name}")
-            if ext == ".pdf":
-                display_pdf(active_file, height=600)
-            elif ext == ".txt":
-                display_text_file(active_file)
-            elif ext == ".docx":
-                display_docx_file(active_file)
+            st.info(f"Copy and open this file path in your browser or PDF reader:")
+            st.code(os.path.abspath(active_file), language="text")
 
 
 # ------------------ Core Functions ------------------
