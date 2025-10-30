@@ -1,0 +1,11 @@
+Django 
+langchain
+langchain-community
+faiss-cpu
+pypdf
+tiktoken
+google-generativeai
+langchain-google-genai
+sentence-transformers
+langchain-huggingface
+langchain-ollama
