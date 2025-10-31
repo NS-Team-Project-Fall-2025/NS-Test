@@ -172,4 +172,27 @@ class VectorStore:
             return results
         except Exception:
             return []
+    
+    def retrieve_by_topics(self, topics: list, num_contexts: int = 10) -> list:
+        """Retrieve relevant documents for each topic using similarity search."""
+        results = []
+        k = max(1, num_contexts // max(1, len(topics)))
+        for topic in topics:
+            docs = self.similarity_search(topic, k=k)
+            for doc in docs:
+                results.append({
+                    "content": doc.page_content if hasattr(doc, 'page_content') else getattr(doc, 'content', ''),
+                    "metadata": getattr(doc, 'metadata', {})
+                })
+        # Deduplicate by content
+        seen = set()
+        unique_results = []
+        for r in results:
+            c = r["content"]
+            if c not in seen:
+                unique_results.append(r)
+                seen.add(c)
+            if len(unique_results) >= num_contexts:
+                break
+        return unique_results
 

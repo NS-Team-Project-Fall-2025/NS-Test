@@ -1,11 +1,14 @@
 import streamlit as st
 import os
-from typing import List
+import copy
+from typing import Any, Dict, List, Optional
 import re
+import difflib
 import base64
 import fitz  # PyMuPDF
 import docx
 import requests
+from datetime import datetime
 
 def inject_fixed_header():
     st.markdown("""
@@ -58,35 +61,126 @@ def inject_fixed_header():
     """, unsafe_allow_html=True)
 
 
+ORDINAL_WORDS = {
+    "first": 1,
+    "second": 2,
+    "third": 3,
+    "fourth": 4,
+    "fifth": 5,
+    "sixth": 6,
+    "seventh": 7,
+    "eighth": 8,
+    "ninth": 9,
+    "tenth": 10,
+}
+
+SUMMARY_COURTESY_TERMS = re.compile(r"\b(?:please|thanks|thank you)\b.*$", re.IGNORECASE)
+
+
+def _clean_doc_phrase(phrase: str) -> str:
+    """Trim courtesy words and trailing punctuation from a captured document hint."""
+    candidate = phrase.strip()
+    if not candidate:
+        return candidate
+    candidate = SUMMARY_COURTESY_TERMS.sub("", candidate).strip()
+    candidate = re.split(r"[.,!?\n]", candidate, maxsplit=1)[0].strip()
+    return candidate
+
+
+def _normalize_doc_name(text: str) -> str:
+    """Lowercase and collapse non-alphanumeric chars for fuzzy comparisons."""
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def _extract_index(tokens: List[str]) -> Optional[int]:
+    """Return an integer index (1-based) from numeric or ordinal tokens."""
+    for token in tokens:
+        if token.isdigit():
+            try:
+                return int(token)
+            except Exception:
+                continue
+    for token in tokens:
+        if token in ORDINAL_WORDS:
+            return ORDINAL_WORDS[token]
+    return None
+
+
+def _match_kb_file(doc_phrase: str, files: List[str], category_hint: Optional[str] = None) -> Optional[str]:
+    """Match a document hint (possibly multi-word) against available files."""
+    if not files:
+        return None
+    if (not doc_phrase or not doc_phrase.strip()) and len(files) == 1:
+        return files[0]
+
+    normalized_target = _normalize_doc_name(doc_phrase or "")
+    if not normalized_target:
+        return None
+
+    tokens = normalized_target.split()
+    index = _extract_index(tokens)
+
+    category_keywords = {
+        "TEXTBOOKs": {"textbook", "book", "tb"},
+        "LECTURE SLIDEs": {"slide", "slides", "deck", "module", "presentation", "lecture"},
+    }
+    keywords = category_keywords.get(category_hint, set())
+
+    if index is not None and 0 < index <= len(files):
+        if not keywords or any(token in keywords for token in tokens):
+            return files[index - 1]
+
+    normalized_files = [
+        (path, _normalize_doc_name(os.path.splitext(os.path.basename(path))[0]))
+        for path in files
+    ]
+
+    for path, norm in normalized_files:
+        if normalized_target == norm:
+            return path
+
+    for path, norm in normalized_files:
+        if normalized_target in norm or norm in normalized_target:
+            return path
+
+    essential_tokens = [token for token in tokens if token not in keywords and len(token) > 1]
+    if essential_tokens:
+        for path, norm in normalized_files:
+            if all(token in norm for token in essential_tokens):
+                return path
+
+    choices = [norm for _, norm in normalized_files]
+    fuzzy_match = difflib.get_close_matches(normalized_target, choices, n=1, cutoff=0.6)
+    if fuzzy_match:
+        match_value = fuzzy_match[0]
+        for path, norm in normalized_files:
+            if norm == match_value:
+                return path
+
+    return None
+
+
 # --- Summarization helpers (module level) ---
 def handle_summarization_request(prompt: str):
     """
     Improved: Robust file matching, always returns summary + citation dict for chat history.
     """
     # Patterns for textbook and slides
-    page_pat = re.compile(r"summari[sz]e\s+page\s+(\d+)\s+from\s+([\w\d_\-\.]+)", re.I)
-    slide_pat = re.compile(r"summari[sz]e\s+slide(?:\s*no)?\s*(\d+)\s+from\s+lecture slides?\s*([\w\d_\-\.]+)", re.I)
+    page_pat = re.compile(r"summari[sz]e\s+page\s+(\d+)(?:\s+(?:of|from))?\s+(.*)", re.I)
+    slide_pat = re.compile(
+        r"summari[sz]e\s+slide(?:\s*(?:number|no\.?)?)?\s*(\d+)(?:\s+(?:of|from))?\s+(?:the\s+)?(.*)",
+        re.I,
+    )
     m_page = page_pat.search(prompt)
     m_slide = slide_pat.search(prompt)
     kb_files = _get_kb_files()
     if m_page:
         page_num = int(m_page.group(1))
-        doc_name = m_page.group(2).lower()
-        # Try to match by index (e.g. 'textbook1' means first file)
+        doc_phrase = _clean_doc_phrase(m_page.group(2))
         files = kb_files.get("TEXTBOOKs", [])
-        file_path = None
-        if doc_name.startswith("textbook") and doc_name[8:].isdigit():
-            idx = int(doc_name[8:]) - 1
-            if 0 <= idx < len(files):
-                file_path = files[idx]
-        # Fallback: match by normalized name
+        file_path = _match_kb_file(doc_phrase, files, category_hint="TEXTBOOKs")
         if not file_path:
-            for f in files:
-                if doc_name in os.path.splitext(os.path.basename(f))[0].lower():
-                    file_path = f
-                    break
-        if not file_path:
-            return {"error": f"No textbook found matching '{doc_name}'."}
+            return {"error": f"No textbook found matching '{doc_phrase or 'your description'}'."}
         ext = os.path.splitext(file_path)[1].lower()
         filename = os.path.basename(file_path)
         if ext == ".pdf":
@@ -121,20 +215,11 @@ def handle_summarization_request(prompt: str):
         return {"summary": summary, "citation": citation}
     elif m_slide:
         slide_num = int(m_slide.group(1))
-        slide_name = m_slide.group(2).lower()
+        doc_phrase = _clean_doc_phrase(m_slide.group(2) or "")
         files = kb_files.get("LECTURE SLIDEs", [])
-        file_path = None
-        if slide_name.isdigit():
-            idx = int(slide_name) - 1
-            if 0 <= idx < len(files):
-                file_path = files[idx]
+        file_path = _match_kb_file(doc_phrase, files, category_hint="LECTURE SLIDEs")
         if not file_path:
-            for f in files:
-                if slide_name in os.path.splitext(os.path.basename(f))[0].lower():
-                    file_path = f
-                    break
-        if not file_path:
-            return {"error": f"No lecture slide found matching '{slide_name}'."}
+            return {"error": f"No lecture slide deck found matching '{doc_phrase or 'your description'}'."}
         ext = os.path.splitext(file_path)[1].lower()
         filename = os.path.basename(file_path)
         if ext == ".pdf":
@@ -236,6 +321,7 @@ def ask_llm_summary(text, num, filename, is_slide=False):
 from utils.document_processor import DocumentProcessor
 from utils.vector_store import VectorStore
 from utils.rag_chain import RAGChain, CombinedRAGChain
+from utils.quiz_agent import QuizAgent
 from utils.session_store import (
     list_sessions,
     load_session,
@@ -243,6 +329,12 @@ from utils.session_store import (
     delete_session,
     create_new_session,
     most_recent_session,
+)
+from utils.quiz_store import (
+    list_quiz_attempts,
+    load_quiz_attempt,
+    save_quiz_attempt,
+    delete_quiz_attempt,
 )
 from config import Config
 
@@ -344,6 +436,18 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "documents_processed" not in st.session_state:
     st.session_state.documents_processed = False
+if "quiz_agent" not in st.session_state:
+    st.session_state.quiz_agent = None
+if "quiz_data" not in st.session_state:
+    st.session_state.quiz_data = None
+if "quiz_results" not in st.session_state:
+    st.session_state.quiz_results = None
+if "quiz_user_answers" not in st.session_state:
+    st.session_state.quiz_user_answers = {}
+if "quiz_history_meta" not in st.session_state:
+    st.session_state.quiz_history_meta = []
+if "quiz_history_loaded" not in st.session_state:
+    st.session_state.quiz_history_loaded = False
 # Chat session persistence
 if "session_id" not in st.session_state:
     st.session_state.session_id = None
@@ -448,7 +552,243 @@ def initialize_components():
     # Default selections for upload and query categories
     st.session_state.setdefault("query_kb", "TEXTBOOKs")
 
+    # Initialize Quiz Agent when stores are ready
+    available_stores = [
+        store for store in [st.session_state.vectorstore_textbooks, st.session_state.vectorstore_slides]
+        if store is not None and getattr(store, "vectorstore", None) is not None
+    ]
+    if available_stores:
+        try:
+            if st.session_state.quiz_agent is None:
+                st.session_state.quiz_agent = QuizAgent(available_stores)
+        except Exception:
+            st.session_state.quiz_agent = None
+    else:
+        st.session_state.quiz_agent = None
 
+
+# ------------------ Quiz Helpers ------------------
+def _ensure_quiz_agent() -> Optional[QuizAgent]:
+    """Return an initialized QuizAgent if vector stores are ready."""
+    agent = st.session_state.get("quiz_agent")
+    if agent:
+        return agent
+    stores = [
+        vs for vs in [st.session_state.vectorstore_textbooks, st.session_state.vectorstore_slides]
+        if vs is not None and getattr(vs, "vectorstore", None) is not None
+    ]
+    if not stores:
+        return None
+    try:
+        agent = QuizAgent(stores)
+        st.session_state.quiz_agent = agent
+        return agent
+    except Exception:
+        st.session_state.quiz_agent = None
+        return None
+
+
+def _clear_quiz_answer_inputs(quiz_data: Optional[Dict[str, Any]]) -> None:
+    """Remove stored Streamlit widget values for quiz answers."""
+    if not quiz_data:
+        return
+    for question in quiz_data.get("questions", []):
+        qid = question.get("id")
+        if not qid:
+            continue
+        key = f"quiz_answer_{qid}"
+        if key in st.session_state:
+            del st.session_state[key]
+
+
+
+
+def _refresh_quiz_history_meta(force: bool = False) -> None:
+    """Load quiz history metadata from disk into session state."""
+    if force or not st.session_state.get("quiz_history_loaded"):
+        try:
+            st.session_state.quiz_history_meta = list_quiz_attempts()
+        except Exception:
+            st.session_state.quiz_history_meta = []
+        st.session_state.quiz_history_loaded = True
+
+def render_quiz_agent_ui():
+    st.subheader("🧠 Quiz Agent")
+    st.caption("Generate adaptive quizzes from your ingested network security materials.")
+
+    if not st.session_state.documents_processed:
+        st.info("Upload and process course documents to enable quiz generation.")
+        return
+
+    agent = _ensure_quiz_agent()
+    if agent is None:
+        st.warning("Quiz agent is not ready yet. Ensure the knowledge base is initialized.")
+        return
+
+    current_quiz = st.session_state.get("quiz_data")
+    cols_reset = st.columns([3, 1])
+    with cols_reset[1]:
+        if current_quiz and st.button("➕ New Quiz", use_container_width=True):
+            _clear_quiz_answer_inputs(current_quiz)
+            st.session_state.quiz_data = None
+            st.session_state.quiz_results = None
+            st.session_state.quiz_user_answers = {}
+            st.rerun()
+
+    with st.form("quiz_generation_form"):
+        mode = st.radio("Quiz generation mode", options=["Random", "By Topic"], horizontal=True)
+        topic_input = ""
+        if mode == "By Topic":
+            topic_input = st.text_input(
+                "Topics (comma-separated)",
+                value="",
+                help="Example: firewalls, intrusion detection, VPN security",
+            )
+        num_mcq = st.number_input("Multiple-choice questions", min_value=1, max_value=5, value=2, step=1)
+        num_tf = st.number_input("True/False questions", min_value=1, max_value=5, value=2, step=1)
+        num_open = st.number_input("Open-ended questions", min_value=1, max_value=3, value=1, step=1)
+        generate = st.form_submit_button(
+            "Generate Quiz" if not current_quiz else "Regenerate Quiz",
+            use_container_width=True,
+        )
+
+    if generate:
+        topics = None
+        if mode == "By Topic":
+            topics = [t.strip() for t in topic_input.split(",") if t.strip()]
+        prev_quiz = st.session_state.get("quiz_data")
+        if prev_quiz:
+            _clear_quiz_answer_inputs(prev_quiz)
+        try:
+            with st.spinner("🧠 Generating quiz..."):
+                quiz_data = agent.generate_quiz(
+                    num_mcq=num_mcq,
+                    num_true_false=num_tf,
+                    num_open_ended=num_open,
+                    topics=topics,
+                    mode="random" if mode == "Random" else "topic",
+                )
+        except Exception as err:
+            st.error(f"Failed to generate quiz: {err}")
+        else:
+            st.session_state.quiz_data = quiz_data
+            st.session_state.quiz_results = None
+            st.session_state.quiz_user_answers = {}
+            st.success("Quiz ready! Review the questions below and submit your answers when ready.")
+            current_quiz = quiz_data
+
+    quiz_data = st.session_state.get("quiz_data")
+    if not quiz_data:
+        return
+
+    st.markdown(f"**Quiz Title:** {quiz_data.get('title')}")
+    if quiz_data.get("topics"):
+        st.markdown(f"**Topics:** {', '.join(quiz_data['topics'])}")
+
+    with st.form("quiz_answer_form"):
+        st.caption("Citations will appear in the feedback after you submit your answers.")
+        for question in quiz_data.get("questions", []):
+            qid = question["id"]
+            qtype = question["type"]
+            st.markdown(f"**{qid}. {question['question']}**")
+
+            key = f"quiz_answer_{qid}"
+            if qtype == "multiple_choice":
+                letters = ["A", "B", "C", "D"]
+                choice_map = {}
+                for idx, letter in enumerate(letters):
+                    if idx >= len(question.get("choices", [])):
+                        continue
+                    raw = str(question["choices"][idx]).strip()
+                    if raw.upper().startswith(f"{letter}."):
+                        choice_map[letter] = raw
+                    else:
+                        choice_map[letter] = f"{letter}. {raw}"
+                options = list(choice_map.keys())
+                st.radio(
+                    "Select your answer",
+                    options=options,
+                    format_func=lambda opt, mapping=choice_map: mapping.get(opt, opt),
+                    key=key,
+                )
+            elif qtype == "true_false":
+                st.radio(
+                    "Select True or False",
+                    options=["True", "False"],
+                    key=key,
+                    horizontal=True,
+                )
+            else:
+                st.text_area("Your answer", key=key, height=140)
+            st.divider()
+
+        submit_answers = st.form_submit_button("Grade Quiz", use_container_width=True)
+
+    if submit_answers:
+        answers: Dict[str, Any] = {}
+        missing_required = []
+        for question in quiz_data.get("questions", []):
+            qid = question["id"]
+            key = f"quiz_answer_{qid}"
+            value = st.session_state.get(key)
+            answers[qid] = value
+            if question["type"] in {"multiple_choice", "true_false"} and not value:
+                missing_required.append(qid)
+        if missing_required:
+            st.warning(f"Please answer all required questions before grading: {', '.join(missing_required)}.")
+        else:
+            try:
+                results = agent.grade_quiz(quiz_data, answers)
+            except Exception as err:
+                st.error(f"Failed to grade quiz: {err}")
+            else:
+                graded_at = datetime.now().isoformat()
+                results["graded_at"] = graded_at
+                st.session_state.quiz_results = results
+                st.session_state.quiz_user_answers = answers
+                attempt_payload = {
+                    "title": quiz_data.get("title"),
+                    "mode": quiz_data.get("mode"),
+                    "topics": quiz_data.get("topics"),
+                    "results": copy.deepcopy(results),
+                    "quiz_data": copy.deepcopy(quiz_data),
+                    "user_answers": copy.deepcopy(answers),
+                    "graded_at": graded_at,
+                }
+                try:
+                    save_quiz_attempt(attempt_payload)
+                except Exception as err:
+                    st.warning(f"Quiz graded but could not be saved to history: {err}")
+                else:
+                    _refresh_quiz_history_meta(force=True)
+                st.success("Quiz graded! Review your feedback below.")
+
+    results = st.session_state.get("quiz_results")
+    if not results:
+        return
+
+    st.markdown(
+        f"**Score:** {results['earned_score']:.1f} / {results['max_score']:.0f} "
+        f"({results['percentage']:.1f}%)"
+    )
+    for outcome in results.get("questions", []):
+        question = outcome["question"]
+        status = "✅" if outcome.get("is_correct") else "❌"
+        st.markdown(f"{status} **{question['id']} – {question['question']}**")
+        st.write(f"Your answer: {outcome.get('user_answer_display', 'Not answered')}")
+        st.write(f"Correct answer: {outcome.get('correct_answer_display', 'N/A')}")
+        st.write(outcome.get("feedback", ""))
+        for citation in outcome.get("citations", []):
+            label = f"[{citation.get('id')}] {citation.get('filename') or 'Unknown source'}"
+            page = citation.get("page_number")
+            if page:
+                label += f" — page {page}"
+            snippet = citation.get("snippet")
+            if snippet:
+                st.caption(f"{label}\n{snippet}")
+            else:
+                st.caption(label)
+        st.markdown("---")
 
 # ------------------ Main UI ------------------
 def main():
@@ -469,6 +809,8 @@ def main():
 
     # Initialize components
     initialize_components()
+
+    _refresh_quiz_history_meta()
 
     # Load most recent session if any
     if not st.session_state.session_loaded:
@@ -544,230 +886,23 @@ def main():
     # ---------- Normal Chat Layout (ChatGPT-like) ----------
     col1, col2 = st.columns([2, 1])
     with col1:
-        st.subheader("💬 Chat")
-
-        # Render existing conversation sequentially
-        for entry in st.session_state.chat_history:
-            # Support legacy Q/A entries as well as new role-based messages
-            if isinstance(entry, dict) and "role" in entry:
-                role = entry.get("role", "assistant")
-                content = entry.get("content", "")
-                with st.chat_message(role):
-                    st.markdown(content)
-                    # Render optional sources/context if present on assistant messages
-                    if role == "assistant":
-                        if st.session_state.get("show_sources", True) and entry.get("sources"):
-                            st.markdown("**Sources**")
-                            for i, source in enumerate(entry.get("sources", []), 1):
-                                page = source.get('page_number')
-                                url = source.get('url')
-                                title = f"📄 Source {i}: {source.get('filename', 'unknown')}{f' — page {page}' if page else ''}"
-                                with st.expander(title):
-                                    st.text(source.get('content_preview', ''))
-                                    if url:
-                                        st.markdown(f"[Open in viewer (page {page})]({url})", unsafe_allow_html=True)
-                        if st.session_state.get("show_context", False) and entry.get("context"):
-                            with st.expander("🔍 Retrieved Context"):
-                                st.text_area("Context used for answering:", entry.get("context", ""), height=200)
-            elif isinstance(entry, dict) and "question" in entry and "answer" in entry:
-                # Legacy record: render as two chat bubbles
-                with st.chat_message("user"):
-                    st.markdown(entry.get("question", ""))
-                with st.chat_message("assistant"):
-                    st.markdown(entry.get("answer", ""))
-                    if st.session_state.get("show_sources", True) and entry.get("sources"):
-                        st.markdown("**Sources**")
-                        for i, source in enumerate(entry.get("sources", []), 1):
-                            page = source.get('page_number')
-                            title = f"📄 Source {i}: {source.get('filename', 'unknown')}{f' — page {page}' if page else ''}"
-                            with st.expander(title):
-                                st.text(source.get('content_preview', ''))
-            else:
-                # Unknown format fallback
-                with st.chat_message("assistant"):
-                    st.markdown(str(entry))
-
-        # Chat input at bottom
-        prompt = st.chat_input("Ask Anything related to Network Security Course...")
-        if prompt is not None:
-            # Instantly show user message in chat window
-            with st.chat_message("user"):
-                st.markdown(prompt)
-            st.session_state.chat_history.append({"role": "user", "content": prompt})
-
-            # Add temporary assistant message for 'Assistant is thinking...'
-            st.session_state.chat_history.append({
-                "role": "assistant",
-                "content": "Assistant is thinking...",
-                "sources": [],
-                "context": "",
-                "kb_used": "TEMP"
-            })
-            
-            
-
-
-            # Persist after user message and temp assistant message
-            if st.session_state.get("session_id"):
-                try:
-                    save_session(st.session_state.session_id, st.session_state.chat_history, st.session_state.get("session_title"))
-                except Exception:
-                    pass
-            else:
-                try:
-                    import uuid as _uuid
-                    from datetime import datetime as _dt
-                    now = _dt.now()
-                    time_str = now.strftime("%H:%M")
-                    date_str = now.strftime("%Y-%m-%d")
-                    new_sid = str(_uuid.uuid4())
-                    short_sid = new_sid[:8]
-                    title = f"{time_str} {date_str} — {short_sid}"
-                    save_session(new_sid, st.session_state.chat_history, title)
-                    st.session_state.session_id = new_sid
-                    st.session_state.session_title = title
-                except Exception:
-                    pass
-
-            # Now process the query (summary or normal)
-            summary_result = handle_summarization_request(prompt)
-            is_summary = isinstance(summary_result, dict) and ("summary" in summary_result or "error" in summary_result)
-            # Summarization: treat as normal assistant message with sources
-            if is_summary:
-                if "error" in summary_result:
-                    with st.chat_message("assistant"):
-                        st.error(summary_result["error"])
-                else:
-                    # Streaming summary from Ollama, match RAG streaming UI
-                    with st.chat_message("assistant"):
-                        placeholder = st.empty()
-                        buffer = ""
-                        citation = summary_result["citation"]
-                        stream_gen = ask_llm_summary_stream(
-                            citation.get("full_text", citation["content_preview"]),
-                            citation["page_number"],
-                            citation["filename"],
-                            is_slide="slide" in prompt.lower()
-                        )
-                        result_final = None
-                        first_token = True
-                        for event in stream_gen:
-                            if event["type"] == "token":
-                                buffer += event["text"]
-                                placeholder.markdown(buffer)
-                                if first_token:
-                                    # Update the temporary assistant message in chat_history
-                                    st.session_state.chat_history[-1] = {
-                                        "role": "assistant",
-                                        "content": buffer,
-                                        "sources": [citation],
-                                        "context": "",
-                                        "kb_used": "SUMMARY"
-                                    }
-                                    first_token = False
-                            elif event["type"] == "final":
-                                buffer = event["text"]
-                                placeholder.markdown(buffer)
-                                result_final = buffer
-                            elif event["type"] == "error":
-                                st.error(event["text"])
-                        # Optionally render sources/citations inline
-                        if st.session_state.get("show_sources", True):
-                            st.markdown("**Sources**")
-                            page = citation.get('page_number')
-                            url = citation.get('url')
-                            title = f"📄 Source: {citation.get('filename', 'unknown')}{f' — page {page}' if page else ''}"
-                            with st.expander(title):
-                                st.text(citation.get('content_preview', ''))
-                                if url:
-                                    st.markdown(f"[Open in viewer (page {page})]({url})", unsafe_allow_html=True)
-                    # Store as assistant message with sources after streaming is complete
-                    st.session_state.chat_history[-1] = {
-                        "role": "assistant",
-                        "content": result_final or buffer,
-                        "sources": [citation],
-                        "context": "",
-                        "kb_used": "SUMMARY"
-                    }
-                    if st.session_state.get("session_id"):
-                        try:
-                            save_session(st.session_state.session_id, st.session_state.chat_history, st.session_state.get("session_title"))
-                        except Exception:
-                            pass
-            else:
-                if not st.session_state.documents_processed:
-                    st.warning("Please upload and process documents before asking questions.", icon="⚠️")
-                elif not prompt.strip():
-                    st.warning("Please enter a message.", icon="⚠️")
-                elif not (st.session_state.rag_chain_textbooks or st.session_state.rag_chain_slides):
-                    st.error("Unexpected error: RAG chains not initialized.")
-                else:
-                    # Generate assistant reply using RAG context history
-                    with st.chat_message("assistant"):
-                        with st.spinner("🤔 Thinking..."):
-                            selected_kb = st.session_state.get("query_kb")
-                            if selected_kb == "BOTH":
-                                active_rag = st.session_state.rag_chain_both or st.session_state.rag_chain_textbooks or st.session_state.rag_chain_slides
-                            elif selected_kb == "LECTURE SLIDEs":
-                                active_rag = st.session_state.rag_chain_slides
-                            else:
-                                active_rag = st.session_state.rag_chain_textbooks
-                            # Stream the response token-by-token (fallback to non-streaming if unavailable)
-                            if hasattr(active_rag, "chat_with_context_stream"):
-                                placeholder = st.empty()
-                                buffer = ""
-                                result_final = None
-                                first_token = True
-                                try:
-                                    for event in active_rag.chat_with_context_stream(prompt, chat_history=st.session_state.chat_history):
-                                        if event.get("type") == "token":
-                                            buffer += event.get("text", "")
-                                            placeholder.markdown(buffer)
-                                            if first_token:
-                                                # Update the temporary assistant message in chat_history
-                                                st.session_state.chat_history[-1] = {
-                                                    "role": "assistant",
-                                                    "content": buffer,
-                                                    "sources": event.get("sources", []),
-                                                    "context": event.get("context", ""),
-                                                    "kb_used": st.session_state.get("query_kb")
-                                                }
-                                                first_token = False
-                                        elif event.get("type") == "final":
-                                            result_final = event
-                                    result = result_final or {"answer": buffer, "sources": [], "context": ""}
-                                except Exception:
-                                    # In case streaming fails mid-way, fall back
-                                    result = active_rag.chat_with_context(prompt, chat_history=st.session_state.chat_history)
-                            else:
-                                result = active_rag.chat_with_context(prompt, chat_history=st.session_state.chat_history)
-                        answer = result.get("answer", "")
-                        # Ensure final rendered answer remains
-                        st.markdown(answer)
-
-                        # Update the temporary assistant message in chat_history with the final answer
-                        st.session_state.chat_history[-1] = {
-                            "role": "assistant",
-                            "content": answer,
-                            "sources": result.get("sources", []),
-                            "context": result.get("context", ""),
-                            "kb_used": st.session_state.get("query_kb")
-                        }
-
-                        # Persist session after each of the assistant reply
-                        if st.session_state.get("session_id"):
-                            try:
-                                save_session(st.session_state.session_id, st.session_state.chat_history, st.session_state.get("session_title"))
-                            except Exception:
-                                pass
-
-                        # Optionally render sources/context inline
-                        if st.session_state.get("show_sources", True) and result.get("sources", []):
-                            # Only show sources with valid filename and content_preview
-                            filtered_sources = [s for s in result.get("sources", []) if s.get("filename") and s.get("content_preview")]
-                            if filtered_sources:
+        tab_chat, tab_quiz = st.tabs(["Tutor Chat", "Quiz Agent"])
+        with tab_chat:
+            st.subheader("💬 Tutor Chat")
+    
+            # Render existing conversation sequentially
+            for entry in st.session_state.chat_history:
+                # Support legacy Q/A entries as well as new role-based messages
+                if isinstance(entry, dict) and "role" in entry:
+                    role = entry.get("role", "assistant")
+                    content = entry.get("content", "")
+                    with st.chat_message(role):
+                        st.markdown(content)
+                        # Render optional sources/context if present on assistant messages
+                        if role == "assistant":
+                            if st.session_state.get("show_sources", True) and entry.get("sources"):
                                 st.markdown("**Sources**")
-                                for i, source in enumerate(filtered_sources, 1):
+                                for i, source in enumerate(entry.get("sources", []), 1):
                                     page = source.get('page_number')
                                     url = source.get('url')
                                     title = f"📄 Source {i}: {source.get('filename', 'unknown')}{f' — page {page}' if page else ''}"
@@ -775,10 +910,221 @@ def main():
                                         st.text(source.get('content_preview', ''))
                                         if url:
                                             st.markdown(f"[Open in viewer (page {page})]({url})", unsafe_allow_html=True)
-                        if st.session_state.get("show_context", False) and result.get("context", ""):
-                            with st.expander("🔍 Retrieved Context"):
-                                st.text_area("Context used for answering:", result.get("context", ""), height=200)
-
+                            if st.session_state.get("show_context", False) and entry.get("context"):
+                                with st.expander("🔍 Retrieved Context"):
+                                    st.text_area("Context used for answering:", entry.get("context", ""), height=200)
+                elif isinstance(entry, dict) and "question" in entry and "answer" in entry:
+                    # Legacy record: render as two chat bubbles
+                    with st.chat_message("user"):
+                        st.markdown(entry.get("question", ""))
+                    with st.chat_message("assistant"):
+                        st.markdown(entry.get("answer", ""))
+                        if st.session_state.get("show_sources", True) and entry.get("sources"):
+                            st.markdown("**Sources**")
+                            for i, source in enumerate(entry.get("sources", []), 1):
+                                page = source.get('page_number')
+                                title = f"📄 Source {i}: {source.get('filename', 'unknown')}{f' — page {page}' if page else ''}"
+                                with st.expander(title):
+                                    st.text(source.get('content_preview', ''))
+                else:
+                    # Unknown format fallback
+                    with st.chat_message("assistant"):
+                        st.markdown(str(entry))
+    
+            # Chat input at bottom
+            prompt = st.chat_input("Ask Anything related to Network Security Course...")
+            if prompt is not None:
+                # Instantly show user message in chat window
+                with st.chat_message("user"):
+                    st.markdown(prompt)
+                st.session_state.chat_history.append({"role": "user", "content": prompt})
+    
+                # Add temporary assistant message for 'Assistant is thinking...'
+                st.session_state.chat_history.append({
+                    "role": "assistant",
+                    "content": "Assistant is thinking...",
+                    "sources": [],
+                    "context": "",
+                    "kb_used": "TEMP"
+                })
+                
+                
+    
+    
+                # Persist after user message and temp assistant message
+                if st.session_state.get("session_id"):
+                    try:
+                        save_session(st.session_state.session_id, st.session_state.chat_history, st.session_state.get("session_title"))
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        import uuid as _uuid
+                        from datetime import datetime as _dt
+                        now = _dt.now()
+                        time_str = now.strftime("%H:%M")
+                        date_str = now.strftime("%Y-%m-%d")
+                        new_sid = str(_uuid.uuid4())
+                        short_sid = new_sid[:8]
+                        title = f"{time_str} {date_str} — {short_sid}"
+                        save_session(new_sid, st.session_state.chat_history, title)
+                        st.session_state.session_id = new_sid
+                        st.session_state.session_title = title
+                    except Exception:
+                        pass
+    
+                # Now process the query (summary or normal)
+                summary_result = handle_summarization_request(prompt)
+                is_summary = isinstance(summary_result, dict) and ("summary" in summary_result or "error" in summary_result)
+                # Summarization: treat as normal assistant message with sources
+                if is_summary:
+                    if "error" in summary_result:
+                        with st.chat_message("assistant"):
+                            st.error(summary_result["error"])
+                    else:
+                        # Streaming summary from Ollama, match RAG streaming UI
+                        with st.chat_message("assistant"):
+                            placeholder = st.empty()
+                            buffer = ""
+                            citation = summary_result["citation"]
+                            stream_gen = ask_llm_summary_stream(
+                                citation.get("full_text", citation["content_preview"]),
+                                citation["page_number"],
+                                citation["filename"],
+                                is_slide="slide" in prompt.lower()
+                            )
+                            result_final = None
+                            first_token = True
+                            for event in stream_gen:
+                                if event["type"] == "token":
+                                    buffer += event["text"]
+                                    placeholder.markdown(buffer)
+                                    if first_token:
+                                        # Update the temporary assistant message in chat_history
+                                        st.session_state.chat_history[-1] = {
+                                            "role": "assistant",
+                                            "content": buffer,
+                                            "sources": [citation],
+                                            "context": "",
+                                            "kb_used": "SUMMARY"
+                                        }
+                                        first_token = False
+                                elif event["type"] == "final":
+                                    buffer = event["text"]
+                                    placeholder.markdown(buffer)
+                                    result_final = buffer
+                                elif event["type"] == "error":
+                                    st.error(event["text"])
+                            # Optionally render sources/citations inline
+                            if st.session_state.get("show_sources", True):
+                                st.markdown("**Sources**")
+                                page = citation.get('page_number')
+                                url = citation.get('url')
+                                title = f"📄 Source: {citation.get('filename', 'unknown')}{f' — page {page}' if page else ''}"
+                                with st.expander(title):
+                                    st.text(citation.get('content_preview', ''))
+                                    if url:
+                                        st.markdown(f"[Open in viewer (page {page})]({url})", unsafe_allow_html=True)
+                        # Store as assistant message with sources after streaming is complete
+                        st.session_state.chat_history[-1] = {
+                            "role": "assistant",
+                            "content": result_final or buffer,
+                            "sources": [citation],
+                            "context": "",
+                            "kb_used": "SUMMARY"
+                        }
+                        if st.session_state.get("session_id"):
+                            try:
+                                save_session(st.session_state.session_id, st.session_state.chat_history, st.session_state.get("session_title"))
+                            except Exception:
+                                pass
+                else:
+                    if not st.session_state.documents_processed:
+                        st.warning("Please upload and process documents before asking questions.", icon="⚠️")
+                    elif not prompt.strip():
+                        st.warning("Please enter a message.", icon="⚠️")
+                    elif not (st.session_state.rag_chain_textbooks or st.session_state.rag_chain_slides):
+                        st.error("Unexpected error: RAG chains not initialized.")
+                    else:
+                        # Generate assistant reply using RAG context history
+                        with st.chat_message("assistant"):
+                            with st.spinner("🤔 Thinking..."):
+                                selected_kb = st.session_state.get("query_kb")
+                                if selected_kb == "BOTH":
+                                    active_rag = st.session_state.rag_chain_both or st.session_state.rag_chain_textbooks or st.session_state.rag_chain_slides
+                                elif selected_kb == "LECTURE SLIDEs":
+                                    active_rag = st.session_state.rag_chain_slides
+                                else:
+                                    active_rag = st.session_state.rag_chain_textbooks
+                                # Stream the response token-by-token (fallback to non-streaming if unavailable)
+                                if hasattr(active_rag, "chat_with_context_stream"):
+                                    placeholder = st.empty()
+                                    buffer = ""
+                                    result_final = None
+                                    first_token = True
+                                    try:
+                                        for event in active_rag.chat_with_context_stream(prompt, chat_history=st.session_state.chat_history):
+                                            if event.get("type") == "token":
+                                                buffer += event.get("text", "")
+                                                placeholder.markdown(buffer)
+                                                if first_token:
+                                                    # Update the temporary assistant message in chat_history
+                                                    st.session_state.chat_history[-1] = {
+                                                        "role": "assistant",
+                                                        "content": buffer,
+                                                        "sources": event.get("sources", []),
+                                                        "context": event.get("context", ""),
+                                                        "kb_used": st.session_state.get("query_kb")
+                                                    }
+                                                    first_token = False
+                                            elif event.get("type") == "final":
+                                                result_final = event
+                                        result = result_final or {"answer": buffer, "sources": [], "context": ""}
+                                    except Exception:
+                                        # In case streaming fails mid-way, fall back
+                                        result = active_rag.chat_with_context(prompt, chat_history=st.session_state.chat_history)
+                                else:
+                                    result = active_rag.chat_with_context(prompt, chat_history=st.session_state.chat_history)
+                            answer = result.get("answer", "")
+                            # Ensure final rendered answer remains
+                            st.markdown(answer)
+    
+                            # Update the temporary assistant message in chat_history with the final answer
+                            st.session_state.chat_history[-1] = {
+                                "role": "assistant",
+                                "content": answer,
+                                "sources": result.get("sources", []),
+                                "context": result.get("context", ""),
+                                "kb_used": st.session_state.get("query_kb")
+                            }
+    
+                            # Persist session after each of the assistant reply
+                            if st.session_state.get("session_id"):
+                                try:
+                                    save_session(st.session_state.session_id, st.session_state.chat_history, st.session_state.get("session_title"))
+                                except Exception:
+                                    pass
+    
+                            # Optionally render sources/context inline
+                            if st.session_state.get("show_sources", True) and result.get("sources", []):
+                                # Only show sources with valid filename and content_preview
+                                filtered_sources = [s for s in result.get("sources", []) if s.get("filename") and s.get("content_preview")]
+                                if filtered_sources:
+                                    st.markdown("**Sources**")
+                                    for i, source in enumerate(filtered_sources, 1):
+                                        page = source.get('page_number')
+                                        url = source.get('url')
+                                        title = f"📄 Source {i}: {source.get('filename', 'unknown')}{f' — page {page}' if page else ''}"
+                                        with st.expander(title):
+                                            st.text(source.get('content_preview', ''))
+                                            if url:
+                                                st.markdown(f"[Open in viewer (page {page})]({url})", unsafe_allow_html=True)
+                            if st.session_state.get("show_context", False) and result.get("context", ""):
+                                with st.expander("🔍 Retrieved Context"):
+                                    st.text_area("Context used for answering:", result.get("context", ""), height=200)
+    
+        with tab_quiz:
+            render_quiz_agent_ui()
     with col2:
         st.subheader("⏱ Chat History")
 
@@ -843,6 +1189,78 @@ def main():
         # Reset the ignore flag after rendering the sidebar to allow future switches
         if st.session_state.get("ignore_next_session_select"):
             st.session_state.ignore_next_session_select = False
+
+        st.subheader("🧾 Quiz History")
+        quiz_meta = st.session_state.get("quiz_history_meta", [])
+        if not quiz_meta:
+            st.caption("No graded quizzes yet.")
+        else:
+            for meta in quiz_meta:
+                quiz_id = meta.get("quiz_id")
+                attempt = load_quiz_attempt(quiz_id) if quiz_id else None
+                if not attempt:
+                    continue
+                results = attempt.get("results", {}) or {}
+                percentage = results.get("percentage", 0.0) or 0.0
+                title = attempt.get("title") or meta.get("title") or "Quiz Attempt"
+
+                def _fmt_iso(value: Optional[str]) -> str:
+                    if not value:
+                        return ""
+                    try:
+                        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
+                    except Exception:
+                        return value
+
+                ts_iso = attempt.get("graded_at") or attempt.get("updated_at") or attempt.get("created_at")
+                ts_display = _fmt_iso(ts_iso)
+                exp_label = f"{title} — {percentage:.1f}%"
+                if ts_display:
+                    exp_label += f" ({ts_display})"
+
+                with st.expander(exp_label):
+                    earned = results.get("earned_score", 0.0) or 0.0
+                    max_score = results.get("max_score", 0.0) or 0.0
+                    st.write(f"Score: {earned:.1f} / {max_score:.0f} ({percentage:.1f}%)")
+                    topics = attempt.get("topics") or meta.get("topics") or []
+                    if topics:
+                        st.write("Topics: " + ", ".join(topics))
+                    graded_display = _fmt_iso(results.get("graded_at") or attempt.get("graded_at"))
+                    if graded_display and graded_display != ts_display:
+                        st.write(f"Graded at: {graded_display}")
+                    question_results = results.get("questions", []) or []
+                    for idx, outcome in enumerate(question_results, start=1):
+                        question = outcome.get("question", {}) or {}
+                        status = "✅" if outcome.get("is_correct") else "❌"
+                        q_id = question.get("id") or f"Q{idx}"
+                        q_text = question.get("question", "")
+                        st.markdown(f"{status} **{q_id} – {q_text}**")
+                        user_display = outcome.get("user_answer_display") or outcome.get("user_answer") or "Not answered"
+                        st.write(f"Your answer: {user_display}")
+                        st.write(f"Correct answer: {outcome.get('correct_answer_display', 'N/A')}")
+                        feedback = outcome.get("feedback")
+                        if feedback:
+                            st.write(feedback)
+                        citations = outcome.get("citations", []) or []
+                        for citation in citations:
+                            label = f"[{citation.get('id')}] {citation.get('filename') or 'Unknown source'}"
+                            page = citation.get("page_number")
+                            if page:
+                                label += f" — page {page}"
+                            snippet = citation.get("snippet")
+                            if snippet:
+                                st.caption(f"{label}\n{snippet}")
+                            else:
+                                st.caption(label)
+                        if idx < len(question_results):
+                            st.markdown("---")
+                    if st.button("🗑️ Delete Quiz", key=f"delete_quiz_{quiz_id}"):
+                        if delete_quiz_attempt(quiz_id):
+                            _refresh_quiz_history_meta(force=True)
+                            st.success("Quiz deleted.")
+                            st.rerun()
+                        else:
+                            st.error("Failed to delete quiz entry.")
 
         # --- Optional Viewer Section (if file selected) ---
         active_file = st.session_state.get("active_view_file")
