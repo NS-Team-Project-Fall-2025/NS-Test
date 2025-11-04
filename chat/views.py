@@ -226,3 +226,134 @@ def mcq_api(request: HttpRequest):
         print(f"Error during MCQ generation: {e}")
         return JsonResponse({'error': f"An error occurred: {e}"}, status=500)
 
+
+@csrf_exempt
+def quiz_check_api(request: HttpRequest):
+    """
+    API endpoint for the Quiz Agent to check a user's answer.
+    It retrieves the correct answer from the cache and
+    returns structured feedback.
+    """
+    if request.method != 'POST':
+        return JsonResponse({'error': 'Invalid request method'}, status=405)
+    
+    try:
+        data = json.loads(request.body)
+        question_id = data.get('question_id')
+        user_answer = data.get('user_answer')
+
+        if not question_id or user_answer is None: # user_answer can be ""
+            return JsonResponse({'error': 'Missing question_id or user_answer'}, status=400)
+
+        # 1. Retrieve the question data from the cache
+        cached_data = cache.get(f"quiz_{question_id}")
+        
+        if not cached_data:
+            return JsonResponse({
+                'error': 'Quiz question not found or has expired. Please generate a new question.'
+            }, status=404)
+        
+        # 2. Get all data needed for grading
+        question = cached_data['question']
+        correct_answer = cached_data['correct_answer']
+        context_chunk = cached_data['context_chunk']
+        question_type = cached_data['question_type']
+        
+        # 3. Prepare the citation (for all answer types)
+        citation = {
+            "source": cached_data['source'],
+            "page": cached_data['page'],
+            "url": None # No web URLs for local docs
+        }
+
+        # 4. Handle grading based on question type
+        
+        # --- Logic for MCQ and True/False (direct comparison) ---
+        if question_type == 'mcq' or question_type == 'true_false':
+            
+            is_correct = (user_answer.strip().lower() == correct_answer.strip().lower())
+            
+            if is_correct:
+                feedback = "That is correct!"
+            else:
+                feedback = "That is incorrect."
+
+            return JsonResponse({
+                "is_correct": is_correct,
+                "feedback": feedback,
+                "correct_answer": correct_answer,
+                "similarity_score": 1.0 if is_correct else 0.0,
+                "citation": citation
+            })
+        
+        # --- Logic for Open-Ended (LLM-based grading) ---
+        elif question_type == 'open_ended':
+            # This is where the "Agent-Based" grading spec is met.
+            
+            llm = ChatOllama(model="mistral", temperature=0.0)
+            
+            grading_prompt_template = """
+            You are a grading agent. Grade the "User's Answer" based *only* on the "Correct Answer" and the "Context".
+            Your goal is to check for semantic similarity and correctness, not exact wording.
+            
+            Respond *only* with a single valid JSON object with three keys:
+            1. "is_correct": boolean (true if the user's answer is semantically correct, false otherwise)
+            2. "feedback": string (a short, one-sentence explanation for the user about their answer)
+            3. "similarity_score": float (a score from 0.0 to 1.0 indicating how close the user's answer is to the correct one)
+            
+            --- CONTEXT (Ground Truth) ---
+            {context}
+            
+            --- QUESTION ---
+            {question}
+            
+            --- IDEAL CORRECT ANSWER (for reference) ---
+            {correct_answer}
+            
+            --- USER'S ANSWER (to be graded) ---
+            {user_answer}
+            
+            --- GRADING (JSON Only) ---
+            """
+            
+            prompt = PromptTemplate(
+                template=grading_prompt_template,
+                input_variables=["context", "question", "correct_answer", "user_answer"]
+            )
+            
+            chain = prompt | llm
+            
+            response_text = chain.invoke({
+                "context": context_chunk,
+                "question": question,
+                "correct_answer": correct_answer,
+                "user_answer": user_answer
+            }).content
+            
+            # Clean and parse
+            if response_text.strip().startswith("```json"):
+                response_text = response_text.strip()[7:-3].strip()
+            
+            grading_data = json.loads(response_text)
+            
+            # Combine and return
+            return JsonResponse({
+                "is_correct": grading_data['is_correct'],
+                "feedback": grading_data['feedback'],
+                "correct_answer": correct_answer, # Always show the ground truth
+                "similarity_score": grading_data['similarity_score'],
+                "citation": citation
+            })
+        
+        else:
+            return JsonResponse({'error': f"Unknown question type: {question_type}"}, status=400)
+
+    except json.JSONDecodeError as e:
+        response_text = locals().get('response_text', 'No response text captured')
+        print(f"Failed to parse JSON from LLM grader: {e} \nRaw text: {response_text}")
+        return JsonResponse({'error': 'Failed to grade answer (JSON parse error).'}, status=500)
+    except Exception as e:
+        print(f"Error during quiz check: {e}")
+        return JsonResponse({'error': f"An error occurred: {e}"}, status=500)
+
+
