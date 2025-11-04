@@ -3,11 +3,10 @@ import json
 from django.shortcuts import render
 from django.http import JsonResponse, HttpRequest
 from django.views.decorators.csrf import csrf_exempt
-
+from django.core.cache import cache
 # --- LangChain Imports ---
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
-# --- Import for 100% OFFLINE generation ---
 from langchain_ollama.chat_models import ChatOllama
 from langchain.prompts import PromptTemplate
 
