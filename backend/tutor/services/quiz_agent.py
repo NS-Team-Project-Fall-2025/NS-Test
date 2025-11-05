@@ -1,15 +1,32 @@
+import ast
 import json
 import random
+import re
 from typing import Any, Dict, List, Optional
 
 import requests
 
 from config import Config
-from utils.vector_store import VectorStore
+from .vector_store import VectorStore
 
 
 class QuizAgent:
     """Generates and grades quizzes grounded in the local network security knowledge base."""
+
+    UNCERTAIN_PHRASES = {
+        "i don't know",
+        "i dont know",
+        "idk",
+        "not sure",
+        "no idea",
+        "can't remember",
+        "cannot remember",
+        "unsure",
+        "i am not sure",
+        "i'm not sure",
+        "dont know",
+        "do not know",
+    }
 
     DEFAULT_RANDOM_TOPICS = [
         "network security fundamentals",
@@ -49,6 +66,8 @@ class QuizAgent:
         num_open_ended: int = 1,
         topics: Optional[List[str]] = None,
         mode: str = "random",
+        difficulty: str = "medium",
+        source_categories: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Generate a quiz with mixed question formats grounded in retrieved context."""
         total_questions = num_mcq + num_true_false + num_open_ended
@@ -56,6 +75,9 @@ class QuizAgent:
             raise ValueError("At least one question must be requested.")
 
         topics_clean = self._prepare_topics(topics, mode)
+        difficulty_clean = (difficulty or "medium").strip().lower()
+        if difficulty_clean not in {"easy", "medium", "hard"}:
+            difficulty_clean = "medium"
         source_map = self._gather_contexts(topics_clean, total_chunks=max(6, total_questions * 2))
         context_prompt = self._format_context_for_prompt(source_map)
 
@@ -65,15 +87,52 @@ class QuizAgent:
             num_true_false=num_true_false,
             num_open=num_open_ended,
             topics=topics_clean,
+            difficulty=difficulty_clean,
         )
 
         llm_response = self._call_llm(prompt)
         quiz_payload = self._parse_quiz_json(llm_response)
 
-        questions = self._normalize_questions(
+        expected_counts = {
+            "multiple_choice": num_mcq,
+            "true_false": num_true_false,
+            "open_ended": num_open_ended,
+        }
+
+        questions, type_counter = self._normalize_questions(
             quiz_payload.get("questions", []),
-            expected_counts={"multiple_choice": num_mcq, "true_false": num_true_false, "open_ended": num_open_ended},
+            expected_counts=expected_counts,
+            enforce=False,
         )
+
+        questions, type_counter = self._ensure_question_completeness(
+            context_prompt=context_prompt,
+            base_questions=questions,
+            type_counter=type_counter,
+            expected_counts=expected_counts,
+            topics=topics_clean,
+            difficulty=difficulty_clean,
+        )
+
+        questions = self._trim_to_expected(questions, expected_counts)
+
+        final_counts = {"multiple_choice": 0, "true_false": 0, "open_ended": 0}
+        for item in questions:
+            q_type = item["type"]
+            if q_type in final_counts:
+                final_counts[q_type] += 1
+        remaining = self._calculate_missing(final_counts, expected_counts)
+        if any(remaining.values()):
+            deficits = ", ".join(
+                f"{k.replace('_', ' ')} (missing {v})"
+                for k, v in remaining.items()
+                if v > 0
+            )
+            raise ValueError(
+                f"Quiz generation could not supply the required question mix even after retries: {deficits}."
+            )
+
+        questions = self._renumber_questions(questions)
 
         quiz_data = {
             "title": quiz_payload.get("quiz_title")
@@ -82,6 +141,8 @@ class QuizAgent:
             "topics": topics_clean,
             "questions": questions,
             "sources": source_map,
+            "difficulty": difficulty_clean,
+            "source_categories": list(source_categories) if source_categories else ["textbooks", "slides"],
         }
         return quiz_data
 
@@ -200,14 +261,11 @@ class QuizAgent:
         formatted_blocks: List[str] = []
         for source_id, entry in source_map.items():
             meta = entry.get("metadata", {})
-            filename = meta.get("filename") or "Unknown source"
-            page_num = meta.get("page_number")
-            header = f"[{source_id}] {filename}"
-            if page_num:
-                header += f" — page {page_num}"
+            header = f"[{source_id}] Course material excerpt"
 
             snippet = entry.get("content", "")
             snippet = snippet.strip()
+            snippet = re.sub(r"^Page\s+\d+\s*\|\s*[^\n]+\n", "", snippet)
             if len(snippet) > 1200:
                 snippet = snippet[:1150].rstrip() + " ..."
 
@@ -221,8 +279,15 @@ class QuizAgent:
         num_true_false: int,
         num_open: int,
         topics: List[str],
+        difficulty: str,
     ) -> str:
         topics_text = ", ".join(topics) if topics else "the network security course materials"
+        difficulty_guidance = {
+            "easy": "Focus on foundational definitions, basic facts, and straightforward recall questions.",
+            "medium": "Blend conceptual understanding with applied reasoning that checks comprehension.",
+            "hard": "Emphasize scenario-based reasoning, multi-step analysis, or nuanced comparisons.",
+        }
+        difficulty_text = difficulty_guidance.get(difficulty, difficulty_guidance["medium"])
 
         return (
             "You are NetSec Quiz Agent, an expert tutor who designs assessments strictly from the provided sources.\n"
@@ -235,6 +300,9 @@ class QuizAgent:
             "- Open-ended questions require a short paragraph answer (3-4 sentences) as the reference solution.\n"
             "- Every question must include an answer explanation that cites the supporting sources using the IDs [S#].\n"
             "- Each question must include a \"citations\" array listing the relevant source IDs (e.g., [\"S1\", \"S3\"]).\n"
+            f"- Target difficulty: {difficulty_text}\n"
+            "- Questions must NOT mention filenames, PDFs, or page numbers. Keep them self-contained and conceptual.\n"
+            "- Citations belong only inside answer_explanation; do not place [S#] in the question text or answer field.\n"
             "- Do NOT fabricate information. If a topic cannot be supported by the sources, adapt the question to what is supported.\n"
             "- Output MUST be valid JSON with UTF-8 characters that can be parsed directly, with no markdown fencing.\n\n"
             "Expected JSON schema:\n"
@@ -282,15 +350,24 @@ class QuizAgent:
                 snippet = text[start : end + 1]
                 try:
                     return json.loads(snippet)
-                except json.JSONDecodeError as err:
-                    raise ValueError(f"Failed to parse quiz JSON: {err}") from err
+                except json.JSONDecodeError:
+                    try:
+                        parsed = ast.literal_eval(snippet)
+                        if isinstance(parsed, dict):
+                            return json.loads(json.dumps(parsed))
+                    except (ValueError, SyntaxError):
+                        pass
+                    raise ValueError(
+                        "Failed to parse quiz JSON: Expecting property name enclosed in double quotes."
+                    )
             raise ValueError("Quiz generation response was not valid JSON.")
 
     def _normalize_questions(
         self,
         questions: List[Dict[str, Any]],
         expected_counts: Dict[str, int],
-    ) -> List[Dict[str, Any]]:
+        enforce: bool = True,
+    ) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
         if not questions:
             raise ValueError("Quiz generation produced no questions.")
 
@@ -333,14 +410,214 @@ class QuizAgent:
             type_counter[q_type] += 1
             normalized.append(record)
 
-        for q_type, expected in expected_counts.items():
-            if type_counter[q_type] < expected:
-                raise ValueError(
-                    f"Quiz generation produced insufficient {q_type.replace('_', ' ')} questions "
-                    f"(expected {expected}, received {type_counter[q_type]})."
+        if enforce:
+            for q_type, expected in expected_counts.items():
+                if type_counter[q_type] < expected:
+                    raise ValueError(
+                        f"Quiz generation produced insufficient {q_type.replace('_', ' ')} questions "
+                        f"(expected {expected}, received {type_counter[q_type]})."
+                    )
+
+        return normalized, type_counter
+
+    def _ensure_question_completeness(
+        self,
+        context_prompt: str,
+        base_questions: List[Dict[str, Any]],
+        type_counter: Dict[str, int],
+        expected_counts: Dict[str, int],
+        topics: List[str],
+        difficulty: str,
+    ) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
+        missing = self._calculate_missing(type_counter, expected_counts)
+        if not any(missing.values()):
+            return base_questions, type_counter
+
+        augmented, counts = self._augment_question_types(
+            context_prompt=context_prompt,
+            existing_questions=base_questions,
+            type_counter=type_counter,
+            expected_counts=expected_counts,
+            missing=missing,
+            topics=topics,
+            difficulty=difficulty,
+        )
+        return augmented, counts
+
+    @staticmethod
+    def _calculate_missing(
+        type_counter: Dict[str, int], expected_counts: Dict[str, int]
+    ) -> Dict[str, int]:
+        missing: Dict[str, int] = {}
+        for key, expected in expected_counts.items():
+            current = type_counter.get(key, 0)
+            deficit = max(0, expected - current)
+            missing[key] = deficit
+        return missing
+
+    def _augment_question_types(
+        self,
+        context_prompt: str,
+        existing_questions: List[Dict[str, Any]],
+        type_counter: Dict[str, int],
+        expected_counts: Dict[str, int],
+        missing: Dict[str, int],
+        topics: List[str],
+        difficulty: str,
+        max_attempts: int = 3,
+    ) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
+        questions = list(existing_questions)
+        counts = dict(type_counter)
+        remaining = dict(missing)
+        source_ids = self._extract_source_ids(context_prompt)
+
+        for q_type in ["multiple_choice", "true_false", "open_ended"]:
+            needed = remaining.get(q_type, 0)
+            attempts = 0
+            while needed > 0 and attempts < max_attempts:
+                attempts += 1
+                prompt = self._build_type_prompt(
+                    context_prompt=context_prompt,
+                    question_type=q_type,
+                    amount=needed,
+                    topics=topics,
+                    source_ids=source_ids,
+                    difficulty=difficulty,
+                )
+                llm_response = self._call_llm(prompt)
+                payload = self._parse_quiz_json(llm_response)
+                extras_raw = payload.get("questions", [])
+                if not isinstance(extras_raw, list):
+                    continue
+
+                extras, _ = self._normalize_questions(
+                    extras_raw,
+                    expected_counts=expected_counts,
+                    enforce=False,
                 )
 
-        return normalized
+                for item in extras:
+                    if item["type"] != q_type:
+                        continue
+                    if remaining[q_type] <= 0:
+                        break
+                    questions.append(item)
+                    counts[q_type] = counts.get(q_type, 0) + 1
+                    remaining[q_type] -= 1
+                    needed = remaining[q_type]
+                # loop continues if still need more
+
+            if remaining.get(q_type, 0) > 0:
+                label = q_type.replace("_", " ")
+                raise ValueError(
+                    f"Quiz generation could not supply the required question mix: {label} (missing {remaining[q_type]})."
+                )
+
+        return questions, counts
+
+    def _build_type_prompt(
+        self,
+        context_prompt: str,
+        question_type: str,
+        amount: int,
+        topics: List[str],
+        source_ids: List[str],
+        difficulty: str,
+    ) -> str:
+        type_labels = {
+            "multiple_choice": "multiple-choice",
+            "true_false": "true/false",
+            "open_ended": "open-ended",
+        }
+        label = type_labels.get(question_type, question_type.replace("_", " "))
+        topics_text = ", ".join(topics) if topics else "the network security course materials"
+        source_hint = ", ".join(source_ids) if source_ids else "S1, S2, ..."
+        difficulty_guidance = {
+            "easy": "Focus on foundational definitions, basic facts, and straightforward recall questions.",
+            "medium": "Blend conceptual understanding with applied reasoning that checks comprehension.",
+            "hard": "Emphasize scenario-based reasoning, multi-step analysis, or nuanced comparisons.",
+        }
+        difficulty_text = difficulty_guidance.get(difficulty, difficulty_guidance["medium"])
+
+        requirements = [
+            f"- Produce exactly {amount} {label} question(s). No extra questions.",
+            "- Every question object must include fields: id, type, question, choices (only for multiple-choice), "
+            "answer, answer_explanation, citations.",
+            "- Set the type field to the requested question type.",
+            "- Use ONLY the provided source IDs in citations: "
+            f"{source_hint}.",
+            "- The answer_explanation must cite the sources using [S#] inline (e.g., [S1]).",
+            f"- Target difficulty: {difficulty_text}",
+            "- Questions must NOT mention filenames, PDFs, or page numbers. Keep them self-contained and conceptual.",
+            "- Do not place [S#] or citations in the question text or answer field.",
+        ]
+        if question_type == "multiple_choice":
+            requirements.extend(
+                [
+                    "- Supply exactly four choices labelled A, B, C, D (strings).",
+                    "- The answer must be the correct letter (A/B/C/D).",
+                ]
+            )
+        elif question_type == "true_false":
+            requirements.append('- The answer must be either "True" or "False".')
+        else:  # open_ended
+            requirements.extend(
+                [
+                    "- Provide a concise paragraph (3-4 sentences) as the reference answer.",
+                    "- The answer field should contain the reference answer text.",
+                ]
+            )
+
+        instructions = "\n".join(requirements)
+
+        return (
+            "You previously generated a quiz but some required question types were missing.\n"
+            "Using ONLY the context snippets below, create the missing questions so the quiz covers "
+            f"{topics_text}.\n\n"
+            f"{instructions}\n"
+            "- Output ONLY a JSON object shaped as {\"questions\": [...]} with no markdown.\n"
+            "- Avoid repeating earlier questions if possible.\n\n"
+            "Context sources:\n"
+            f"{context_prompt}\n\n"
+            "Return the JSON object now:\n"
+        )
+
+    @staticmethod
+    def _extract_source_ids(context_prompt: str) -> List[str]:
+        if not context_prompt:
+            return []
+        ids = re.findall(r"\[(S\d+)\]", context_prompt)
+        seen = set()
+        ordered: List[str] = []
+        for cid in ids:
+            if cid not in seen:
+                seen.add(cid)
+                ordered.append(cid)
+        return ordered
+
+    @staticmethod
+    def _trim_to_expected(
+        questions: List[Dict[str, Any]],
+        expected_counts: Dict[str, int],
+    ) -> List[Dict[str, Any]]:
+        counters = {key: 0 for key in expected_counts}
+        trimmed: List[Dict[str, Any]] = []
+        for question in questions:
+            q_type = question["type"]
+            allowed = expected_counts.get(q_type)
+            if allowed is None:
+                continue
+            if counters[q_type] >= allowed:
+                continue
+            trimmed.append(question)
+            counters[q_type] += 1
+        return trimmed
+
+    @staticmethod
+    def _renumber_questions(questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        for idx, question in enumerate(questions, start=1):
+            question["id"] = f"Q{idx}"
+        return questions
 
     def _default_quiz_title(self, mode: str, topics: List[str]) -> str:
         if mode.lower() == "random" or not topics:
@@ -448,6 +725,32 @@ class QuizAgent:
         user_answer: str,
         sources: Dict[str, Dict[str, Any]],
     ) -> Dict[str, Any]:
+        cleaned = user_answer.strip()
+        normalized = cleaned.lower()
+        word_count = len(re.findall(r"\b\w+\b", cleaned))
+        if any(phrase in normalized for phrase in self.UNCERTAIN_PHRASES):
+            return {
+                "is_correct": False,
+                "score": 0.0,
+                "feedback": (
+                    "❌ Answers that express uncertainty (e.g., 'I don't know') "
+                    "do not earn credit. Review the reference explanation:\n"
+                    + question["answer_explanation"]
+                ),
+                "citations": question.get("citations", []),
+            }
+        if word_count < 6:
+            return {
+                "is_correct": False,
+                "score": 0.0,
+                "feedback": (
+                    "❌ The response is too brief to demonstrate understanding. "
+                    "Provide a complete explanation. Reference answer:\n"
+                    + question["answer_explanation"]
+                ),
+                "citations": question.get("citations", []),
+            }
+
         allowed_ids = question.get("citations", [])
         context_prompt = self._format_context_for_prompt(
             {cid: sources[cid] for cid in allowed_ids if cid in sources}
@@ -455,6 +758,9 @@ class QuizAgent:
         prompt = (
             "You are grading a student's open-ended answer using ONLY the provided sources.\n"
             "Decide if the answer demonstrates sufficient understanding.\n"
+            "Responses that confess uncertainty (e.g., \"I don't know\", \"not sure\", \"no idea\")"
+            " must be marked incorrect with score 0.0.\n"
+            "Do NOT award credit unless the student's explanation clearly matches the reference answer's key points.\n"
             "Provide JSON with fields: is_correct (true/false), score (0.0-1.0), feedback (2-3 sentences with [S#] citations), "
             "citations (list of source IDs used).\n\n"
             f"Question:\n{question['question']}\n\n"
@@ -480,8 +786,8 @@ class QuizAgent:
                     "❌ Unable to automatically grade the response. "
                     "Here is the reference explanation:\n" + question["answer_explanation"]
                 ),
-            "citations": allowed_ids,
-        }
+                "citations": allowed_ids,
+            }
 
     def _map_citations(
         self,

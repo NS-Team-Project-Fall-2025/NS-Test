@@ -46,6 +46,8 @@ def list_quiz_attempts() -> List[Dict[str, Any]]:
                         "graded_at": data.get("graded_at"),
                         "percentage": results.get("percentage"),
                         "topics": data.get("topics") or [],
+                        "difficulty": data.get("difficulty"),
+                        "source_categories": data.get("source_categories") or [],
                     }
                 )
             except Exception:
@@ -90,6 +92,8 @@ def save_quiz_attempt(attempt: Dict[str, Any]) -> Dict[str, Any]:
     data["title"] = attempt.get("title") or data.get("title") or "Quiz Attempt"
     data["mode"] = attempt.get("mode") or data.get("mode")
     data["topics"] = attempt.get("topics") or data.get("topics") or []
+    data["difficulty"] = attempt.get("difficulty") or data.get("difficulty")
+    data["source_categories"] = attempt.get("source_categories") or data.get("source_categories") or []
     data["results"] = attempt.get("results") or data.get("results") or {}
     data["quiz_data"] = attempt.get("quiz_data") or data.get("quiz_data")
     data["user_answers"] = attempt.get("user_answers") or data.get("user_answers") or {}

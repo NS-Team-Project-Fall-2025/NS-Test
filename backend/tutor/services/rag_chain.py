@@ -1,7 +1,7 @@
 from typing import List, Dict, Any, Optional, Sequence
 from langchain.schema import Document
 from langchain_community.llms import Ollama
-from utils.vector_store import VectorStore
+from .vector_store import VectorStore
 from config import Config
 
 class RAGChain:
