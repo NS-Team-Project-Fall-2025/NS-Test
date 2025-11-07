@@ -1,0 +1,875 @@
+function QuizPage() {
+    const [config, setConfig] = (0,react__WEBPACK_IMPORTED_MODULE_1__.useState)(initialConfig);
+    const [quiz, setQuiz] = (0,react__WEBPACK_IMPORTED_MODULE_1__.useState)(null);
+    const [answers, setAnswers] = (0,react__WEBPACK_IMPORTED_MODULE_1__.useState)({});
+    const [grading, setGrading] = (0,react__WEBPACK_IMPORTED_MODULE_1__.useState)(false);
+    const [isGenerating, setGenerating] = (0,react__WEBPACK_IMPORTED_MODULE_1__.useState)(false);
+    const [result, setResult] = (0,react__WEBPACK_IMPORTED_MODULE_1__.useState)(null);
+    const [history, setHistory] = (0,react__WEBPACK_IMPORTED_MODULE_1__.useState)([]);
+    const [message, setMessage] = (0,react__WEBPACK_IMPORTED_MODULE_1__.useState)(null);
+    (0,react__WEBPACK_IMPORTED_MODULE_1__.useEffect)(()=>{
+        refreshHistory();
+    }, []);
+    const formatDifficulty = (value)=>value ? value.charAt(0).toUpperCase() + value.slice(1) : "";
+    function updateConfig(field, value) {
+        setConfig((prev)=>({
+                ...prev,
+                [field]: value
+            }));
+    }
+    async function refreshHistory() {
+        try {
+            const payload = await (0,_lib_api__WEBPACK_IMPORTED_MODULE_2__.listQuizHistory)();
+            setHistory(payload.attempts || []);
+        } catch (err) {
+            setMessage({
+                text: err.message,
+                tone: "danger"
+            });
+        }
+    }
+    async function handleGenerate(event) {
+        event.preventDefault();
+        if (isGenerating) return;
+        setGenerating(true);
+        setMessage(null);
+        setQuiz(null);
+        setResult(null);
+        setAnswers({});
+        try {
+            const sourceCategories = config.sourceCategory === "both" ? [
+                "textbooks",
+                "slides"
+            ] : [
+                config.sourceCategory
+            ];
+            const payload = await (0,_lib_api__WEBPACK_IMPORTED_MODULE_2__.generateQuiz)({
+                num_mcq: Number(config.num_mcq),
+                num_true_false: Number(config.num_true_false),
+                num_open_ended: Number(config.num_open_ended),
+                mode: config.mode,
+                difficulty: config.difficulty,
+                source_categories: sourceCategories,
+                topics: config.topics ? config.topics.split(",").map((topic)=>topic.trim()) : undefined
+            });
+            setQuiz(payload);
+        } catch (err) {
+            setMessage({
+                text: err.message,
+                tone: "danger"
+            });
+        } finally{
+            setGenerating(false);
+        }
+    }
+    function updateAnswer(qid, value) {
+        setAnswers((prev)=>({
+                ...prev,
+                [qid]: value
+            }));
+    }
+    async function handleGrade(event) {
+        event.preventDefault();
+        if (!quiz) return;
+        setGrading(true);
+        setMessage(null);
+        try {
+            const payload = await (0,_lib_api__WEBPACK_IMPORTED_MODULE_2__.gradeQuiz)(quiz, answers);
+            setResult(payload.results);
+            setQuiz(payload.attempt?.quiz_data || quiz);
+            refreshHistory();
+        } catch (err) {
+            setMessage({
+                text: err.message,
+                tone: "danger"
+            });
+        } finally{
+            setGrading(false);
+        }
+    }
+    async function handleHistorySelect(id) {
+        try {
+            const attempt = await (0,_lib_api__WEBPACK_IMPORTED_MODULE_2__.getQuizAttempt)(id);
+            if (attempt.error) {
+                setMessage({
+                    text: attempt.error,
+                    tone: "danger"
+                });
+                return;
+            }
+            setQuiz(attempt.quiz_data);
+            setAnswers(attempt.user_answers || {});
+            setResult(attempt.results || null);
+            setMessage({
+                text: `Loaded quiz attempt "${attempt.title || id}"`,
+                tone: "success"
+            });
+        } catch (err) {
+            setMessage({
+                text: err.message,
+                tone: "danger"
+            });
+        }
+    }
+    async function handleHistoryDelete(id) {
+        try {
+            await (0,_lib_api__WEBPACK_IMPORTED_MODULE_2__.deleteQuizAttemptApi)(id);
+            refreshHistory();
+            setMessage({
+                text: "Quiz attempt deleted.",
+                tone: "success"
+            });
+        } catch (err) {
+            setMessage({
+                text: err.message,
+                tone: "danger"
+            });
+        }
+    }
+    return /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+        className: "card",
+        children: [
+            /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("h2", {
+                children: "Quiz Lab"
+            }, void 0, false, {
+                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                lineNumber: 135,
+                columnNumber: 7
+            }, this),
+            /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("p", {
+                className: "muted",
+                style: {
+                    marginBottom: "1.5rem"
+                },
+                children: "Generate quizzes grounded in your knowledge base. Grade responses to reveal precise feedback with citations."
+            }, void 0, false, {
+                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                lineNumber: 136,
+                columnNumber: 7
+            }, this),
+            message && /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                className: "chat-bubble",
+                style: {
+                    borderColor: message.tone === "danger" ? "rgba(248,113,113,0.4)" : "rgba(52,211,153,0.35)",
+                    color: message.tone === "danger" ? "#fecaca" : "#dcfce7"
+                },
+                children: message.text
+            }, void 0, false, {
+                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                lineNumber: 141,
+                columnNumber: 9
+            }, this),
+            /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("form", {
+                className: "grid two",
+                onSubmit: handleGenerate,
+                style: {
+                    marginBottom: "2rem"
+                },
+                children: [
+                    /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                        className: "card",
+                        style: {
+                            margin: 0
+                        },
+                        children: [
+                            /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("label", {
+                                children: "Multiple-choice"
+                            }, void 0, false, {
+                                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                lineNumber: 154,
+                                columnNumber: 11
+                            }, this),
+                            /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("input", {
+                                className: "input",
+                                type: "number",
+                                min: "0",
+                                value: config.num_mcq,
+                                onChange: (e)=>updateConfig("num_mcq", e.target.value),
+                                disabled: isGenerating
+                            }, void 0, false, {
+                                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                lineNumber: 155,
+                                columnNumber: 11
+                            }, this),
+                            /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("label", {
+                                children: "True / False"
+                            }, void 0, false, {
+                                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                lineNumber: 163,
+                                columnNumber: 11
+                            }, this),
+                            /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("input", {
+                                className: "input",
+                                type: "number",
+                                min: "0",
+                                value: config.num_true_false,
+                                onChange: (e)=>updateConfig("num_true_false", e.target.value),
+                                disabled: isGenerating
+                            }, void 0, false, {
+                                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                lineNumber: 164,
+                                columnNumber: 11
+                            }, this),
+                            /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("label", {
+                                children: "Open-ended"
+                            }, void 0, false, {
+                                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                lineNumber: 172,
+                                columnNumber: 11
+                            }, this),
+                            /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("input", {
+                                className: "input",
+                                type: "number",
+                                min: "0",
+                                value: config.num_open_ended,
+                                onChange: (e)=>updateConfig("num_open_ended", e.target.value),
+                                disabled: isGenerating
+                            }, void 0, false, {
+                                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                lineNumber: 173,
+                                columnNumber: 11
+                            }, this),
+                            /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("label", {
+                                children: "Knowledge Source"
+                            }, void 0, false, {
+                                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                lineNumber: 181,
+                                columnNumber: 9
+                            }, this),
+                            /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                                className: "radio-group",
+                                children: [
+                                    {
+                                        value: "both",
+                                        label: "Textbooks + Lecture Slides"
+                                    },
+                                    {
+                                        value: "textbooks",
+                                        label: "Textbooks only"
+                                    },
+                                    {
+                                        value: "slides",
+                                        label: "Lecture Slides only"
+                                    }
+                                ].map((option)=>/*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("label", {
+                                        children: [
+                                            /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("input", {
+                                                type: "radio",
+                                                name: "sourceCategory",
+                                                value: option.value,
+                                                checked: config.sourceCategory === option.value,
+                                                onChange: (e)=>updateConfig("sourceCategory", e.target.value),
+                                                disabled: isGenerating
+                                            }, void 0, false, {
+                                                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                                lineNumber: 189,
+                                                columnNumber: 17
+                                            }, this),
+                                            " ",
+                                            option.label
+                                        ]
+                                    }, option.value, true, {
+                                        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                        lineNumber: 188,
+                                        columnNumber: 15
+                                    }, this))
+                            }, void 0, false, {
+                                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                lineNumber: 182,
+                                columnNumber: 11
+                            }, this)
+                        ]
+                    }, void 0, true, {
+                        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                        lineNumber: 153,
+                        columnNumber: 9
+                    }, this),
+                    /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                        className: "card",
+                        style: {
+                            margin: 0
+                        },
+                        children: [
+                            /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("label", {
+                                children: "Mode"
+                            }, void 0, false, {
+                                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                lineNumber: 204,
+                                columnNumber: 11
+                            }, this),
+                            /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("select", {
+                                value: config.mode,
+                                onChange: (e)=>updateConfig("mode", e.target.value),
+                                disabled: isGenerating,
+                                children: [
+                                    /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("option", {
+                                        value: "random",
+                                        children: "Random"
+                                    }, void 0, false, {
+                                        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                        lineNumber: 210,
+                                        columnNumber: 13
+                                    }, this),
+                                    /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("option", {
+                                        value: "custom",
+                                        children: "Custom topics"
+                                    }, void 0, false, {
+                                        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                        lineNumber: 211,
+                                        columnNumber: 13
+                                    }, this)
+                                ]
+                            }, void 0, true, {
+                                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                lineNumber: 205,
+                                columnNumber: 11
+                            }, this),
+                            /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("label", {
+                                children: "Difficulty"
+                            }, void 0, false, {
+                                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                lineNumber: 213,
+                                columnNumber: 11
+                            }, this),
+                            /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("select", {
+                                value: config.difficulty,
+                                onChange: (e)=>updateConfig("difficulty", e.target.value),
+                                disabled: isGenerating,
+                                children: [
+                                    /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("option", {
+                                        value: "easy",
+                                        children: "Easy"
+                                    }, void 0, false, {
+                                        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                        lineNumber: 219,
+                                        columnNumber: 13
+                                    }, this),
+                                    /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("option", {
+                                        value: "medium",
+                                        children: "Medium"
+                                    }, void 0, false, {
+                                        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                        lineNumber: 220,
+                                        columnNumber: 13
+                                    }, this),
+                                    /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("option", {
+                                        value: "hard",
+                                        children: "Hard"
+                                    }, void 0, false, {
+                                        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                        lineNumber: 221,
+                                        columnNumber: 13
+                                    }, this)
+                                ]
+                            }, void 0, true, {
+                                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                lineNumber: 214,
+                                columnNumber: 11
+                            }, this),
+                            /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("label", {
+                                children: "Topics (comma separated)"
+                            }, void 0, false, {
+                                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                lineNumber: 224,
+                                columnNumber: 11
+                            }, this),
+                            /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("textarea", {
+                                className: "textarea-small",
+                                placeholder: "E.g. symmetric encryption, TLS handshake",
+                                value: config.topics,
+                                onChange: (e)=>updateConfig("topics", e.target.value),
+                                disabled: config.mode !== "custom" || isGenerating
+                            }, void 0, false, {
+                                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                lineNumber: 225,
+                                columnNumber: 11
+                            }, this),
+                            /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("button", {
+                                className: "button",
+                                type: "submit",
+                                disabled: isGenerating,
+                                children: isGenerating ? "Generating..." : "Generate quiz"
+                            }, void 0, false, {
+                                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                lineNumber: 232,
+                                columnNumber: 11
+                            }, this)
+                        ]
+                    }, void 0, true, {
+                        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                        lineNumber: 203,
+                        columnNumber: 9
+                    }, this)
+                ]
+            }, void 0, true, {
+                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                lineNumber: 152,
+                columnNumber: 7
+            }, this),
+            isGenerating && /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                className: "loading-indicator",
+                children: [
+                    /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("span", {
+                        className: "spinner",
+                        "aria-hidden": "true"
+                    }, void 0, false, {
+                        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                        lineNumber: 240,
+                        columnNumber: 11
+                    }, this),
+                    /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("span", {
+                        children: "Generating quiz... this may take a few seconds."
+                    }, void 0, false, {
+                        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                        lineNumber: 241,
+                        columnNumber: 11
+                    }, this)
+                ]
+            }, void 0, true, {
+                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                lineNumber: 239,
+                columnNumber: 9
+            }, this),
+            quiz && /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("form", {
+                onSubmit: handleGrade,
+                children: /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                    className: "card",
+                    style: {
+                        marginBottom: "2rem"
+                    },
+                    children: [
+                        /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("h3", {
+                            children: quiz.title
+                        }, void 0, false, {
+                            fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                            lineNumber: 248,
+                            columnNumber: 13
+                        }, this),
+                        /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                            className: "inline-form",
+                            style: {
+                                gap: "0.5rem",
+                                marginBottom: "0.75rem"
+                            },
+                            children: [
+                                quiz.difficulty && /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("span", {
+                                    className: "pill-badge",
+                                    children: [
+                                        "Difficulty: ",
+                                        formatDifficulty(quiz.difficulty)
+                                    ]
+                                }, void 0, true, {
+                                    fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                    lineNumber: 251,
+                                    columnNumber: 17
+                                }, this),
+                                quiz.source_categories?.length ? /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("span", {
+                                    className: "pill-badge",
+                                    children: [
+                                        "Sources: ",
+                                        quiz.source_categories.map((cat)=>SOURCE_LABELS[cat] || cat).join(", ")
+                                    ]
+                                }, void 0, true, {
+                                    fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                    lineNumber: 254,
+                                    columnNumber: 17
+                                }, this) : null
+                            ]
+                        }, void 0, true, {
+                            fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                            lineNumber: 249,
+                            columnNumber: 13
+                        }, this),
+                        quiz.topics?.length ? /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                            className: "pill",
+                            style: {
+                                marginBottom: "1rem"
+                            },
+                            children: [
+                                "Topics: ",
+                                quiz.topics.join(", ")
+                            ]
+                        }, void 0, true, {
+                            fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                            lineNumber: 260,
+                            columnNumber: 15
+                        }, this) : null,
+                        (quiz.questions || []).map((question)=>/*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                                className: "quiz-question",
+                                children: [
+                                    /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("h3", {
+                                        children: [
+                                            question.id,
+                                            ". ",
+                                            question.question
+                                        ]
+                                    }, void 0, true, {
+                                        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                        lineNumber: 266,
+                                        columnNumber: 17
+                                    }, this),
+                                    question.type === "multiple_choice" && /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                                        className: "radio-group",
+                                        children: question.choices.map((choice, index)=>{
+                                            const [label, text] = choice.split(".", 2);
+                                            const optionValue = (label || "").trim() || String.fromCharCode(65 + index);
+                                            return /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("label", {
+                                                children: [
+                                                    /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("input", {
+                                                        type: "radio",
+                                                        name: question.id,
+                                                        value: optionValue.trim(),
+                                                        checked: answers[question.id] === optionValue.trim(),
+                                                        onChange: (e)=>updateAnswer(question.id, e.target.value)
+                                                    }, void 0, false, {
+                                                        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                                        lineNumber: 276,
+                                                        columnNumber: 27
+                                                    }, this),
+                                                    " ",
+                                                    text ? `${optionValue}. ${text.trim()}` : choice
+                                                ]
+                                            }, optionValue, true, {
+                                                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                                lineNumber: 275,
+                                                columnNumber: 25
+                                            }, this);
+                                        })
+                                    }, void 0, false, {
+                                        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                        lineNumber: 270,
+                                        columnNumber: 19
+                                    }, this),
+                                    question.type === "true_false" && /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                                        className: "radio-group",
+                                        children: [
+                                            "True",
+                                            "False"
+                                        ].map((option)=>/*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("label", {
+                                                children: [
+                                                    /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("input", {
+                                                        type: "radio",
+                                                        name: question.id,
+                                                        value: option,
+                                                        checked: answers[question.id] === option,
+                                                        onChange: (e)=>updateAnswer(question.id, e.target.value)
+                                                    }, void 0, false, {
+                                                        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                                        lineNumber: 293,
+                                                        columnNumber: 25
+                                                    }, this),
+                                                    " ",
+                                                    option
+                                                ]
+                                            }, option, true, {
+                                                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                                lineNumber: 292,
+                                                columnNumber: 23
+                                            }, this))
+                                    }, void 0, false, {
+                                        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                        lineNumber: 290,
+                                        columnNumber: 19
+                                    }, this),
+                                    question.type === "open_ended" && /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("textarea", {
+                                        className: "textarea-small",
+                                        value: answers[question.id] || "",
+                                        onChange: (e)=>updateAnswer(question.id, e.target.value)
+                                    }, void 0, false, {
+                                        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                        lineNumber: 306,
+                                        columnNumber: 19
+                                    }, this)
+                                ]
+                            }, question.id, true, {
+                                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                lineNumber: 265,
+                                columnNumber: 15
+                            }, this)),
+                        /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("button", {
+                            className: "button",
+                            type: "submit",
+                            disabled: grading || isGenerating,
+                            children: grading ? "Grading..." : "Grade quiz"
+                        }, void 0, false, {
+                            fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                            lineNumber: 314,
+                            columnNumber: 13
+                        }, this)
+                    ]
+                }, void 0, true, {
+                    fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                    lineNumber: 247,
+                    columnNumber: 11
+                }, this)
+            }, void 0, false, {
+                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                lineNumber: 246,
+                columnNumber: 9
+            }, this),
+            result && /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                className: "card",
+                children: [
+                    /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("h3", {
+                        children: [
+                            "Score: ",
+                            result.earned_score.toFixed(1),
+                            " / ",
+                            result.max_score,
+                            " (",
+                            result.percentage.toFixed(1),
+                            "%)"
+                        ]
+                    }, void 0, true, {
+                        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                        lineNumber: 323,
+                        columnNumber: 11
+                    }, this),
+                    (result.questions || []).map((item, idx)=>/*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                            className: "quiz-question",
+                            children: [
+                                /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                                    className: "inline-form",
+                                    style: {
+                                        marginBottom: "0.5rem"
+                                    },
+                                    children: /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("span", {
+                                        className: "pill-badge",
+                                        children: item.is_correct ? "Correct" : "Needs review"
+                                    }, void 0, false, {
+                                        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                        lineNumber: 330,
+                                        columnNumber: 17
+                                    }, this)
+                                }, void 0, false, {
+                                    fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                    lineNumber: 329,
+                                    columnNumber: 15
+                                }, this),
+                                /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("strong", {
+                                    children: item.question?.question
+                                }, void 0, false, {
+                                    fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                    lineNumber: 334,
+                                    columnNumber: 15
+                                }, this),
+                                /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                                    className: "list-muted",
+                                    children: [
+                                        "Your answer: ",
+                                        item.user_answer_display || "—"
+                                    ]
+                                }, void 0, true, {
+                                    fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                    lineNumber: 335,
+                                    columnNumber: 15
+                                }, this),
+                                /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                                    className: "list-muted",
+                                    children: [
+                                        "Expected: ",
+                                        item.correct_answer_display || "—"
+                                    ]
+                                }, void 0, true, {
+                                    fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                    lineNumber: 336,
+                                    columnNumber: 15
+                                }, this),
+                                item.feedback && /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                                    style: {
+                                        marginTop: "0.75rem"
+                                    },
+                                    children: item.feedback
+                                }, void 0, false, {
+                                    fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                    lineNumber: 338,
+                                    columnNumber: 17
+                                }, this),
+                                (item.citations || []).length > 0 && /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                                    className: "chat-sources",
+                                    style: {
+                                        marginTop: "0.75rem"
+                                    },
+                                    children: item.citations.map((citation, idx2)=>/*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                                            className: "chat-source",
+                                            children: [
+                                                /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("strong", {
+                                                    children: citation.filename || "Source"
+                                                }, void 0, false, {
+                                                    fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                                    lineNumber: 344,
+                                                    columnNumber: 23
+                                                }, this),
+                                                citation.page_number ? /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("span", {
+                                                    children: [
+                                                        " \xb7 page ",
+                                                        citation.page_number
+                                                    ]
+                                                }, void 0, true, {
+                                                    fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                                    lineNumber: 345,
+                                                    columnNumber: 47
+                                                }, this) : null,
+                                                citation.snippet ? /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                                                    className: "list-muted",
+                                                    style: {
+                                                        marginTop: "0.25rem"
+                                                    },
+                                                    children: citation.snippet
+                                                }, void 0, false, {
+                                                    fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                                    lineNumber: 347,
+                                                    columnNumber: 25
+                                                }, this) : null
+                                            ]
+                                        }, idx2, true, {
+                                            fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                            lineNumber: 343,
+                                            columnNumber: 21
+                                        }, this))
+                                }, void 0, false, {
+                                    fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                    lineNumber: 341,
+                                    columnNumber: 17
+                                }, this)
+                            ]
+                        }, idx, true, {
+                            fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                            lineNumber: 328,
+                            columnNumber: 13
+                        }, this))
+                ]
+            }, void 0, true, {
+                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                lineNumber: 322,
+                columnNumber: 9
+            }, this),
+            /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                className: "card",
+                children: [
+                    /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("h3", {
+                        children: "History"
+                    }, void 0, false, {
+                        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                        lineNumber: 361,
+                        columnNumber: 9
+                    }, this),
+                    history.length === 0 && /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("p", {
+                        className: "muted",
+                        children: "No graded quizzes stored yet."
+                    }, void 0, false, {
+                        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                        lineNumber: 362,
+                        columnNumber: 34
+                    }, this),
+                    history.map((attempt)=>/*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                            className: "file-item",
+                            children: [
+                                /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                                    children: [
+                                        /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("strong", {
+                                            children: attempt.title || attempt.quiz_id
+                                        }, void 0, false, {
+                                            fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                            lineNumber: 366,
+                                            columnNumber: 15
+                                        }, this),
+                                        /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                                            className: "list-muted",
+                                            children: attempt.topics?.length ? `Topics: ${attempt.topics.join(", ")}` : "Random topics"
+                                        }, void 0, false, {
+                                            fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                            lineNumber: 367,
+                                            columnNumber: 15
+                                        }, this),
+                                        attempt.difficulty && /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                                            className: "list-muted",
+                                            children: [
+                                                "Difficulty: ",
+                                                formatDifficulty(attempt.difficulty)
+                                            ]
+                                        }, void 0, true, {
+                                            fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                            lineNumber: 371,
+                                            columnNumber: 17
+                                        }, this),
+                                        attempt.source_categories?.length ? /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                                            className: "list-muted",
+                                            children: [
+                                                "Sources: ",
+                                                attempt.source_categories.map((cat)=>SOURCE_LABELS[cat] || cat).join(", ")
+                                            ]
+                                        }, void 0, true, {
+                                            fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                            lineNumber: 374,
+                                            columnNumber: 17
+                                        }, this) : null,
+                                        /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                                            className: "list-muted",
+                                            children: [
+                                                "Score:",
+                                                " ",
+                                                typeof attempt.percentage === "number" ? `${attempt.percentage.toFixed(1)}%` : "—"
+                                            ]
+                                        }, void 0, true, {
+                                            fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                            lineNumber: 378,
+                                            columnNumber: 15
+                                        }, this)
+                                    ]
+                                }, void 0, true, {
+                                    fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                    lineNumber: 365,
+                                    columnNumber: 13
+                                }, this),
+                                /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("div", {
+                                    className: "inline-form",
+                                    style: {
+                                        marginBottom: 0
+                                    },
+                                    children: [
+                                        /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("button", {
+                                            className: "button secondary",
+                                            type: "button",
+                                            onClick: ()=>handleHistorySelect(attempt.quiz_id),
+                                            children: "View"
+                                        }, void 0, false, {
+                                            fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                            lineNumber: 386,
+                                            columnNumber: 15
+                                        }, this),
+                                        /*#__PURE__*/ (0,react_jsx_dev_runtime__WEBPACK_IMPORTED_MODULE_0__.jsxDEV)("button", {
+                                            className: "button secondary",
+                                            type: "button",
+                                            onClick: ()=>handleHistoryDelete(attempt.quiz_id),
+                                            children: "Delete"
+                                        }, void 0, false, {
+                                            fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                            lineNumber: 389,
+                                            columnNumber: 15
+                                        }, this)
+                                    ]
+                                }, void 0, true, {
+                                    fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                                    lineNumber: 385,
+                                    columnNumber: 13
+                                }, this)
+                            ]
+                        }, attempt.quiz_id, true, {
+                            fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                            lineNumber: 364,
+                            columnNumber: 11
+                        }, this))
+                ]
+            }, void 0, true, {
+                fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+                lineNumber: 360,
+                columnNumber: 7
+            }, this)
+        ]
+    }, void 0, true, {
+        fileName: "/Users/saicharanlanka/NetSec-Tutor-Test/frontend/pages/quiz.js",
+        lineNumber: 134,
+        columnNumber: 5
+    }, this);
+}
