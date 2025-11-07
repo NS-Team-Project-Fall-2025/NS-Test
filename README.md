@@ -110,6 +110,8 @@ The project reads configuration from `config.py`. The configurable variables are
 - The frontend expects the backend to stream chat tokens; keep both servers running for the full experience.
 - When adjusting configuration, restart the Django server to ensure new environment variables are loaded.
 
+
+
 ## Troubleshooting
 
 - **LLM errors** – Confirm Ollama is running and the model listed in `OLLAMA_MODEL` is installed.
