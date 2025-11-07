@@ -73,6 +73,8 @@ class QuizAgent:
         total_questions = num_mcq + num_true_false + num_open_ended
         if total_questions <= 0:
             raise ValueError("At least one question must be requested.")
+        if total_questions > 15:
+            raise ValueError("Please request 15 or fewer total questions per quiz.")
 
         topics_clean = self._prepare_topics(topics, mode)
         difficulty_clean = (difficulty or "medium").strip().lower()
@@ -177,6 +179,15 @@ class QuizAgent:
                     "feedback": "Unsupported question type.",
                     "citations": [],
                 }
+
+            score_value = float(result.get("score", 0.0))
+            score_possible = 1.0
+            result["score_possible"] = score_possible
+            result["score_display"] = self._format_score_display(score_value, score_possible)
+            result["score_breakdown"] = {
+                "earned": score_value,
+                "possible": score_possible,
+            }
 
             graded_questions.append(result)
             earned_score += max(0.0, min(1.0, result.get("score", 0.0)))
@@ -401,7 +412,16 @@ class QuizAgent:
                 if not isinstance(choices, list) or len(choices) != 4:
                     continue
                 record["choices"] = [str(choice).strip() for choice in choices]
-                record["answer"] = record["answer"].strip().upper()
+                raw_answer = record["answer"].strip()
+                choice_map = self._choice_label_map(record)
+                normalized_answer = self._resolve_choice_value(
+                    raw_answer,
+                    choice_map,
+                    record["choices"],
+                )
+                if normalized_answer is None:
+                    continue
+                record["answer"] = normalized_answer
             elif q_type == "true_false":
                 record["answer"] = record["answer"].strip().capitalize()
             else:  # open_ended
@@ -506,8 +526,20 @@ class QuizAgent:
                     remaining[q_type] -= 1
                     needed = remaining[q_type]
                 # loop continues if still need more
-
             if remaining.get(q_type, 0) > 0:
+                if q_type == "open_ended":
+                    added = False
+                    while remaining[q_type] > 0:
+                        fallback = self._fallback_open_ended_question(questions)
+                        if not fallback:
+                            break
+                        questions.append(fallback)
+                        counts[q_type] = counts.get(q_type, 0) + 1
+                        remaining[q_type] -= 1
+                        added = True
+                    if remaining[q_type] <= 0:
+                        continue
+
                 label = q_type.replace("_", " ")
                 raise ValueError(
                     f"Quiz generation could not supply the required question mix: {label} (missing {remaining[q_type]})."
@@ -633,12 +665,45 @@ class QuizAgent:
         user_answer: Optional[str],
         sources: Dict[str, Dict[str, Any]],
     ) -> Dict[str, Any]:
-        correct_letter = question["answer"].strip().upper()
-        user_letter = (user_answer or "").strip().upper()
-        is_correct = bool(user_letter) and user_letter == correct_letter
         choices_map = self._choice_label_map(question)
-        correct_display = choices_map.get(correct_letter, correct_letter)
-        user_display = choices_map.get(user_letter, "Not answered") if user_letter else "Not answered"
+        raw_choices = question.get("choices", []) or []
+
+        raw_correct = (question.get("answer") or "").strip()
+        raw_user = (user_answer or "").strip()
+
+        correct_letter = self._resolve_choice_value(raw_correct, choices_map, raw_choices)
+        user_letter = self._resolve_choice_value(raw_user, choices_map, raw_choices)
+
+        is_correct = bool(correct_letter) and user_letter == correct_letter
+
+        if not is_correct and raw_user and raw_correct:
+            if self._normalize_choice_text(raw_user) == self._normalize_choice_text(raw_correct):
+                is_correct = True
+                if not user_letter:
+                    user_letter = correct_letter
+
+        correct_choice_text = self._choice_text_from_letter(correct_letter, raw_choices)
+        user_choice_text = self._choice_text_from_letter(user_letter, raw_choices)
+        if correct_choice_text:
+            correct_display = correct_choice_text.upper()
+        else:
+            correct_display = raw_correct.upper() if raw_correct else "Not answered"
+
+        if user_letter:
+            if user_choice_text:
+                user_display = user_choice_text
+            else:
+                user_display = raw_user or "Not answered"
+        else:
+            user_display = raw_user or "Not answered"
+
+        if user_choice_text:
+            stored_user_answer = user_choice_text.upper()
+        elif raw_user:
+            stored_user_answer = raw_user.upper()
+        else:
+            stored_user_answer = user_letter or ""
+
         feedback = (
             ("✅ Correct! " if is_correct else "❌ Not quite. ")
             + "Explanation:\n"
@@ -647,7 +712,7 @@ class QuizAgent:
         citations = self._map_citations(question["citations"], sources)
         return {
             "question": question,
-            "user_answer": user_letter,
+            "user_answer": stored_user_answer,
             "user_answer_display": user_display,
             "is_correct": is_correct,
             "score": 1.0 if is_correct else 0.0,
@@ -662,15 +727,24 @@ class QuizAgent:
         user_answer: Optional[str],
         sources: Dict[str, Dict[str, Any]],
     ) -> Dict[str, Any]:
-        correct_value = question["answer"]
+        verdict = self._determine_true_false_answer(question, sources)
+        correct_value = verdict.get("answer") if verdict else question["answer"]
+        explanation = verdict.get("explanation") if verdict else question["answer_explanation"]
+        citation_ids = verdict.get("citations") if verdict else question["citations"]
+        if not citation_ids:
+            citation_ids = question.get("citations", [])
+
         formatted = (user_answer or "").strip().capitalize()
         is_correct = formatted in {"True", "False"} and formatted == correct_value
         feedback = (
             ("✅ Correct! " if is_correct else "❌ Not quite. ")
             + "Explanation:\n"
-            + question["answer_explanation"]
+            + explanation
         )
-        citations = self._map_citations(question["citations"], sources)
+        citations = self._map_citations(citation_ids, sources)
+        question["answer"] = correct_value
+        question["answer_explanation"] = explanation
+        question["citations"] = citation_ids
         return {
             "question": question,
             "user_answer": formatted,
@@ -810,6 +884,16 @@ class QuizAgent:
             )
         return mapped
 
+    @staticmethod
+    def _format_score_display(score: float, possible: float) -> str:
+        earned_text = f"{score:.2f}".rstrip("0").rstrip(".")
+        possible_text = f"{possible:.2f}".rstrip("0").rstrip(".")
+        if not earned_text:
+            earned_text = "0"
+        if not possible_text:
+            possible_text = "0"
+        return f"{earned_text}/{possible_text}"
+
     def _choice_label_map(self, question: Dict[str, Any]) -> Dict[str, str]:
         mapping: Dict[str, str] = {}
         choices = question.get("choices", []) or []
@@ -823,3 +907,150 @@ class QuizAgent:
             else:
                 mapping[letter] = f"{letter}. {raw}"
         return mapping
+
+    @staticmethod
+    def _normalize_choice_text(value: str) -> str:
+        trimmed = value.strip()
+        if re.match(r"^[A-D](?:[\.\)\-:]+\s*|\s+)", trimmed, flags=re.IGNORECASE):
+            trimmed = re.sub(r"^[A-D][\.\)\-:]*\s*", "", trimmed, count=1, flags=re.IGNORECASE)
+        trimmed = trimmed.replace("–", "-").replace("—", "-")
+        cleaned = re.sub(r"\s+", " ", trimmed)
+        cleaned = cleaned.rstrip(" .,:;!?")
+        return cleaned.lower()
+
+    @staticmethod
+    def _choice_text_from_letter(letter: Optional[str], raw_choices: List[Any]) -> Optional[str]:
+        if not letter:
+            return None
+        idx = ord(letter.upper()) - ord("A")
+        if 0 <= idx < len(raw_choices):
+            return str(raw_choices[idx]).strip()
+        return None
+
+    def _fallback_open_ended_question(self, questions: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        seed = None
+        for candidate in questions:
+            if candidate.get("type") == "multiple_choice":
+                seed = candidate
+                break
+        if seed is None:
+            for candidate in questions:
+                if candidate.get("type") == "true_false":
+                    seed = candidate
+                    break
+        if seed is None:
+            return None
+
+        base_text = (seed.get("question") or "").strip()
+        base_text = base_text.rstrip(" ?.")
+        prompt = f"In your own words, explain the concept: {base_text}."
+
+        explanation = self._clean_fallback_text(seed.get("answer_explanation") or "")
+        if not explanation:
+            explanation = self._clean_fallback_text(seed.get("answer") or "")
+        citations = [c for c in seed.get("citations", []) if c]
+        if not explanation or not citations:
+            return None
+
+        question_id = self._next_question_id(questions)
+        return {
+            "id": question_id,
+            "type": "open_ended",
+            "question": prompt,
+            "answer": explanation,
+            "answer_explanation": explanation,
+            "citations": citations,
+        }
+
+    @staticmethod
+    def _clean_fallback_text(text: str) -> str:
+        cleaned = text.strip()
+        cleaned = re.sub(r"^[✅❌]\s*", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned
+
+    def _determine_true_false_answer(
+        self,
+        question: Dict[str, Any],
+        sources: Dict[str, Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        allowed_ids = question.get("citations", [])
+        context_prompt = self._format_context_for_prompt(
+            {cid: sources[cid] for cid in allowed_ids if cid in sources}
+        )
+        if not context_prompt.strip():
+            return None
+        prompt = (
+            "You are verifying a true/false statement using ONLY the provided sources.\n"
+            "Return strict JSON with fields: answer (\"True\" or \"False\"), "
+            "explanation (2 sentences with [S#] citations), citations (list of source IDs).\n"
+            "Do not include extra fields or commentary.\n\n"
+            f"Statement:\n{question['question']}\n\n"
+            f"Existing answer key says: {question.get('answer', 'Unknown')}\n"
+            f"Sources:\n{context_prompt}\n\n"
+            "JSON:"
+        )
+        try:
+            response_text = self._call_llm(prompt)
+            data = json.loads(response_text)
+            answer = (data.get("answer") or "").strip().capitalize()
+            if answer not in {"True", "False"}:
+                return None
+            explanation = (data.get("explanation") or "").strip()
+            citations = [cid for cid in data.get("citations", []) if cid in allowed_ids]
+            if not citations:
+                citations = allowed_ids
+            return {
+                "answer": answer,
+                "explanation": explanation or question.get("answer_explanation"),
+                "citations": citations,
+            }
+        except Exception:
+            return None
+
+    def _next_question_id(self, existing: List[Dict[str, Any]]) -> str:
+        used = {str(item.get("id") or "").strip() for item in existing}
+        counter = len(existing) + 1
+        while True:
+            candidate = f"FALLBACK_{counter}"
+            if candidate not in used:
+                return candidate
+            counter += 1
+
+    def _resolve_choice_value(
+        self,
+        value: Optional[str],
+        choices_map: Dict[str, str],
+        raw_choices: List[Any],
+    ) -> Optional[str]:
+        if not value:
+            return None
+        candidate = value.strip()
+        if not candidate:
+            return None
+
+        upper_candidate = candidate.upper()
+        if upper_candidate in choices_map:
+            return upper_candidate
+
+        # Handle inputs like "A" / "a" / "A)" directly
+        if len(upper_candidate) == 1 and upper_candidate in {"A", "B", "C", "D"}:
+            return upper_candidate
+        if (
+            len(upper_candidate) >= 2
+            and upper_candidate[0] in {"A", "B", "C", "D"}
+            and upper_candidate[1] in {".", ")", ":", "-", " "}
+        ):
+            return upper_candidate[0]
+
+        normalized_candidate = self._normalize_choice_text(candidate)
+        for letter, display in choices_map.items():
+            if self._normalize_choice_text(display) == normalized_candidate:
+                return letter
+
+        for idx, choice in enumerate(raw_choices):
+            letter = chr(ord("A") + idx)
+            if self._normalize_choice_text(str(choice)) == normalized_candidate:
+                return letter
+
+        return None
