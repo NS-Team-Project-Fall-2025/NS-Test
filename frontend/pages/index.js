@@ -29,7 +29,7 @@ export default function TutorPage() {
 
   useEffect(() => {
     if (chatEndRef.current) {
-      chatEndRef.current.scrollIntoView({ behavior: "smooth" });
+      chatEndRef.current.scrollIntoView({ behavior: "smooth", block: "end" });
     }
   }, [messages]);
 
@@ -191,6 +191,10 @@ export default function TutorPage() {
     event.preventDefault();
     const question = input.trim();
     if (!question) return;
+    if (question.length > 200) {
+      setError("Question must be 200 characters or fewer.");
+      return;
+    }
     setInput("");
     await submitMessage(question);
   }
@@ -200,6 +204,10 @@ export default function TutorPage() {
       event.preventDefault();
       const question = input.trim();
       if (!question || isStreaming) return;
+      if (question.length > 200) {
+        setError("Question must be 200 characters or fewer.");
+        return;
+      }
       setInput("");
       submitMessage(question);
     }
@@ -258,7 +266,7 @@ export default function TutorPage() {
         <div className="chat-window">
           {messages.map((message, index) => (
             <div
-              key={`${message.role}-${index}-${message.content.slice(0, 5)}`}
+              key={`${message.role}-${index}`}
               className={`chat-bubble ${message.role} ${message.streaming ? "streaming" : ""}`}
             >
               <h4>{message.role === "user" ? "You" : "NetSec Tutor"}</h4>
@@ -302,13 +310,29 @@ export default function TutorPage() {
             className="textarea-small"
             placeholder="Ask about Network Security materials, type your question here..."
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => {
+              const val = e.target.value;
+              if (val.length <= 200) {
+                setInput(val);
+                setError(null);
+              } else {
+                // enforce max length in UI
+                setInput(val.slice(0, 200));
+                setError("Max 200 characters allowed.");
+              }
+            }}
+            maxLength={200}
             onKeyDown={handleInputKeyDown}
             disabled={isStreaming}
           />
-          <button className="button" type="submit" disabled={isStreaming || !input.trim()}>
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end" }}>
+            <div className="list-muted" style={{ fontSize: "0.85rem", marginBottom: "0.35rem" }}>
+              {input.length}/200
+            </div>
+            <button className="button" type="submit" disabled={isStreaming || !input.trim() || input.trim().length > 200}>
             {isStreaming ? "Streaming..." : "Send"}
-          </button>
+            </button>
+          </div>
         </form>
       </div>
     </div>

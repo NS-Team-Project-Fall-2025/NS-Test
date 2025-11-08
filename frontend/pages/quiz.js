@@ -253,9 +253,20 @@ export default function QuizPage() {
             className="textarea-small"
             placeholder="E.g. symmetric encryption, TLS handshake"
             value={config.topics}
-            onChange={(e) => updateConfig("topics", e.target.value)}
+            onChange={(e) => {
+              const val = e.target.value;
+              if (val.length <= 100) {
+                updateConfig("topics", val);
+                setMessage(null);
+              } else {
+                updateConfig("topics", val.slice(0, 100));
+                setMessage({ text: "Max 100 characters allowed for topics.", tone: "danger" });
+              }
+            }}
             disabled={config.mode !== "custom" || isGenerating}
+            maxLength={100}
           />
+          <div className="list-muted" style={{ fontSize: "0.85rem", marginTop: "0.35rem" }}>{config.topics.length}/100</div>
           <button className="button" type="submit" disabled={isGenerating}>
             {isGenerating ? "Generating..." : "Generate quiz"}
           </button>
