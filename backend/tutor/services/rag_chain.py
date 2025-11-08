@@ -1,8 +1,124 @@
-from typing import List, Dict, Any, Optional, Sequence
+import json
+import re
+from typing import List, Dict, Any, Optional, Sequence, Tuple
 from langchain_core.documents import Document
 from langchain_ollama import OllamaLLM
 from .vector_store import VectorStore
 from config import Config
+
+OUTPUT_FORMAT_INSTRUCTIONS = (
+    "\nOutput formatting requirements:\n"
+    "1. The very first line must be a single-line JSON object containing a boolean field named \"show_sources\" "
+    '(example: {"show_sources": true}).\n'
+    "   - Use true when your answer is grounded in the provided context snippets.\n"
+    "   - Use false only when you must refuse because the answer is not present in the provided context.\n"
+    "2. After a blank line, write the natural-language answer exactly as it should appear to the user.\n"
+    "3. Do not emit any other JSON or text before the JSON control line.\n"
+)
+
+REFUSAL_TEXT = "I can only assist with content from the provided Network Security course materials."
+_STOP_WORDS = {
+    "the",
+    "this",
+    "that",
+    "with",
+    "from",
+    "what",
+    "when",
+    "where",
+    "your",
+    "about",
+    "explain",
+    "describe",
+    "give",
+    "tell",
+    "does",
+    "have",
+    "into",
+    "which",
+    "will",
+    "them",
+    "they",
+    "their",
+    "page",
+    "summarize",
+    "summary",
+    "detail",
+    "details",
+    "need",
+    "help",
+    "please",
+}
+
+
+def _with_output_format(prompt: str) -> str:
+    """Append the standardized output-format instructions to a prompt."""
+    return f"{prompt}{OUTPUT_FORMAT_INSTRUCTIONS}"
+
+
+def _split_structured_answer(raw: Any) -> Tuple[bool, str]:
+    """Split a model response into (show_sources, answer_text) according to the control JSON header."""
+    if not isinstance(raw, str):
+        text = str(raw)
+    else:
+        text = raw
+    stripped = text.lstrip()
+    newline_idx = stripped.find("\n")
+    if not stripped.startswith("{") or newline_idx == -1:
+        return True, text.strip()
+    header_line = stripped[:newline_idx].strip()
+    try:
+        header = json.loads(header_line)
+    except Exception:
+        return True, text.strip()
+    show_sources = bool(header.get("show_sources", True))
+    body = stripped[newline_idx + 1 :].lstrip("\r\n")
+    return show_sources, body.strip()
+
+
+def _consume_control_prefix(buffer: str) -> Optional[Tuple[bool, int]]:
+    """Attempt to parse the control JSON from the beginning of a streaming buffer.
+
+    Returns (show_sources, end_index) if successful, where end_index is the position in the original buffer
+    immediately after the JSON line and any trailing blank lines.
+    """
+    stripped = buffer.lstrip()
+    if not stripped.startswith("{"):
+        return None
+    newline_idx = stripped.find("\n")
+    if newline_idx == -1:
+        return None
+    header_line = stripped[:newline_idx].strip()
+    try:
+        header = json.loads(header_line)
+    except Exception:
+        return None
+    show_sources = bool(header.get("show_sources", True))
+    offset = len(buffer) - len(stripped)
+    end_idx = offset + newline_idx + 1
+    while end_idx < len(buffer) and buffer[end_idx] in "\r\n":
+        end_idx += 1
+    return show_sources, end_idx
+
+
+def _extract_query_keywords(text: str) -> List[str]:
+    tokens = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return [tok for tok in tokens if len(tok) >= 4 and tok not in _STOP_WORDS]
+
+
+def _context_matches_keywords(documents: List[Document], keywords: List[str]) -> bool:
+    if not keywords:
+        return True
+    combined = " ".join((doc.page_content or "").lower() for doc in documents)
+    if not combined.strip():
+        return False
+    return any(keyword in combined for keyword in keywords)
+
+
+def _question_supported_by_context(question: str, documents: List[Document]) -> bool:
+    keywords = _extract_query_keywords(question)
+    return _context_matches_keywords(documents, keywords)
+
 
 class RAGChain:
     def __init__(self, vector_store: VectorStore):
@@ -22,7 +138,6 @@ class RAGChain:
         Supports explicit page-focused queries like: "Summarize/Explain/Describe Page 135 from Network Security Essentials".
         """
         # Detect page-focused intent
-        import re
         m = re.search(
             r"(?:summari[sz]e|explain|describe|discuss|what(?:'s| is)?\s+on)\s+(?:the\s+)?page\s*(\d+)"
             r"|page\s*(\d+)\s+(?:summary|summari[sz]e|explanation|explain|details)",
@@ -88,7 +203,6 @@ class RAGChain:
         """Generate a strict, context-grounded prompt (single-turn).
         If the user asked to summarize a page, switch to a page-summary prompt.
         """
-        import re
         # Detect requested page from the user's query
         req_page = None
         m = re.search(
@@ -141,7 +255,7 @@ class RAGChain:
                 f"User request:\n{query}\n\n"
                 "Final page summary:"
             )
-            return prompt
+            return _with_output_format(prompt)
 
         # Default QA template
         prompt = f"""You are NetSec Tutor, an expert assistant restricted to the provided Network Security materials.
@@ -160,7 +274,7 @@ User question:
 
 Final answer (follow the rules):
 """
-        return prompt
+        return _with_output_format(prompt)
     
     def _extract_last_user_questions(self, chat_history: Optional[List[Dict]]) -> List[str]:
         """Extract user messages from history, return last two before the most recent user message.
@@ -215,7 +329,7 @@ Final answer (follow the rules):
     
     def _build_final_prompt(self, latest_question: str, context: str, recent_turns: str) -> str:
         """Build the final multi-part prompt for the LLM."""
-        return (
+        return _with_output_format(
             "You are NetSec Tutor, restricted to the provided Network Security context. "
             "Answer ONLY using the retrieved snippets below. If not answerable from them, reply exactly: "
             "\"I can only assist with content from the provided Network Security course materials.\"\n\n"
@@ -236,10 +350,20 @@ Final answer (follow the rules):
             
             if not documents:
                 return {
-                    "answer": "I can only assist with content from the provided Network Security course materials.",
+                    "answer": REFUSAL_TEXT,
                     "sources": [],
                     "context": "",
-                    "query": query
+                    "query": query,
+                    "show_sources": False,
+                }
+
+            if not _question_supported_by_context(query, documents):
+                return {
+                    "answer": REFUSAL_TEXT,
+                    "sources": [],
+                    "context": "",
+                    "query": query,
+                    "show_sources": False,
                 }
             
             # Step 2: Format context
@@ -250,7 +374,7 @@ Final answer (follow the rules):
             
             # Step 4: Get response from Ollama
             response = self.model.invoke(prompt)
-            answer = response
+            show_sources, answer = _split_structured_answer(response)
             
             # Step 5: Extract sources
             sources = []
@@ -278,7 +402,8 @@ Final answer (follow the rules):
                 "answer": answer,
                 "sources": sources,
                 "context": context,
-                "query": query
+                "query": query,
+                "show_sources": show_sources,
             }
             
         except Exception as e:
@@ -286,7 +411,8 @@ Final answer (follow the rules):
                 "answer": f"An error occurred while generating the answer: {str(e)}",
                 "sources": [],
                 "context": "",
-                "query": query
+                "query": query,
+                "show_sources": False,
             }
     
     def chat_with_context(self, query: str, chat_history: List[Dict] = None, k: int = 4) -> Dict[str, Any]:
@@ -296,16 +422,26 @@ Final answer (follow the rules):
             last_two = self._extract_last_user_questions(chat_history)
             combined_retrieval_query = self._rewrite_retrieval_query(last_two, query)
             documents = self.retrieve_documents(combined_retrieval_query, k=k)
+            if not documents or not _question_supported_by_context(query, documents):
+                return {
+                    "answer": REFUSAL_TEXT,
+                    "sources": [],
+                    "context": "",
+                    "query": query,
+                    "retrieval_query": combined_retrieval_query,
+                    "show_sources": False,
+                }
             context = self.format_context(documents)
             recent_turns = self._format_recent_turns(chat_history, max_messages=6)
             # If page-intent is detected, prefer the single-turn summary prompt; otherwise use conversation prompt
             page_aware_prompt = self.generate_prompt(query, context, documents)
             # Heuristic: if page-aware prompt is a summary prompt (it contains 'Final page summary:'), use it
             if "Final page summary:" in page_aware_prompt:
-                answer = self.model.invoke(page_aware_prompt)
+                raw_answer = self.model.invoke(page_aware_prompt)
             else:
                 final_prompt = self._build_final_prompt(query, context, recent_turns)
-                answer = self.model.invoke(final_prompt)
+                raw_answer = self.model.invoke(final_prompt)
+            show_sources, answer = _split_structured_answer(raw_answer)
             sources = []
             for doc in documents:
                 src_path = doc.metadata.get('source') or ''
@@ -331,26 +467,40 @@ Final answer (follow the rules):
                 "sources": sources,
                 "context": context,
                 "query": query,
-                "retrieval_query": combined_retrieval_query
+                "retrieval_query": combined_retrieval_query,
+                "show_sources": show_sources,
             }
         except Exception as e:
             return {
                 "answer": f"An error occurred while generating the answer: {str(e)}",
                 "sources": [],
                 "context": "",
-                "query": query
+                "query": query,
+                "show_sources": False,
             }
 
     def chat_with_context_stream(self, query: str, chat_history: Optional[List[Dict]] = None, k: int = 4):
         """Stream tokens from Ollama while keeping RAG grounding.
         Yields dict events: {"type": "token", "text": str} and final: {"type": "final", ...}.
         """
-        import json
         import requests
         chat_history = chat_history or []
         last_two = self._extract_last_user_questions(chat_history)
         combined_retrieval_query = self._rewrite_retrieval_query(last_two, query)
         documents = self.retrieve_documents(combined_retrieval_query, k=k)
+        if not documents or not _question_supported_by_context(query, documents):
+            refusal = REFUSAL_TEXT
+            yield {"type": "token", "text": refusal}
+            yield {
+                "type": "final",
+                "answer": refusal,
+                "sources": [],
+                "context": "",
+                "query": query,
+                "retrieval_query": combined_retrieval_query,
+                "show_sources": False,
+            }
+            return
         context = self.format_context(documents)
         recent_turns = self._format_recent_turns(chat_history, max_messages=6)
         # Build a page-aware prompt for streaming if applicable
@@ -379,13 +529,6 @@ Final answer (follow the rules):
                 "content_preview": (doc.page_content[:200] + "...") if len(doc.page_content) > 200 else doc.page_content
             })
 
-        # If no context found, we still stream a refusal per guardrails
-        if not documents:
-            refusal = "I can only assist with content from the provided Network Security course materials."
-            yield {"type": "token", "text": refusal}
-            yield {"type": "final", "answer": refusal, "sources": [], "context": context, "query": query, "retrieval_query": combined_retrieval_query}
-            return
-
         # Stream from Ollama generate endpoint
         url = f"{Config.OLLAMA_BASE_URL}/api/generate"
         payload = {
@@ -396,10 +539,13 @@ Final answer (follow the rules):
                 "temperature": Config.OLLAMA_TEMPERATURE
             }
         }
+        control_buffer = ""
+        control_parsed = False
+        show_sources_flag = True
+        answer_chunks: List[str] = []
         try:
             with requests.post(url, json=payload, stream=True) as r:
                 r.raise_for_status()
-                full = []
                 for line in r.iter_lines(decode_unicode=True):
                     if not line:
                         continue
@@ -411,11 +557,30 @@ Final answer (follow the rules):
                         break
                     chunk = obj.get("response") or obj.get("data") or ""
                     if chunk:
-                        full.append(chunk)
+                        if not control_parsed:
+                            control_buffer += chunk
+                            parsed = _consume_control_prefix(control_buffer)
+                            if parsed:
+                                show_sources_flag, consumed_idx = parsed
+                                remainder = control_buffer[consumed_idx:]
+                                if remainder:
+                                    answer_chunks.append(remainder)
+                                    yield {"type": "token", "text": remainder}
+                                control_parsed = True
+                                control_buffer = ""
+                            continue
+                        answer_chunks.append(chunk)
                         yield {"type": "token", "text": chunk}
-                answer = "".join(full).strip()
+                if not control_parsed and control_buffer:
+                    control_parsed = True
+                    remainder = control_buffer
+                    if remainder:
+                        answer_chunks.append(remainder)
+                        yield {"type": "token", "text": remainder}
+                answer = "".join(answer_chunks).strip()
         except Exception as e:
             answer = f"[Streaming error: {e}]"
+            show_sources_flag = False
         yield {
             "type": "final",
             "answer": answer,
@@ -423,6 +588,7 @@ Final answer (follow the rules):
             "context": context,
             "query": query,
             "retrieval_query": combined_retrieval_query,
+            "show_sources": show_sources_flag,
         }
 
 
@@ -443,9 +609,7 @@ class CombinedRAGChain:
         """Stream tokens from Ollama while keeping RAG grounding across multiple stores.
         Yields dict events: {"type": "token", "text": str} and final: {"type": "final", ...}.
         """
-        import json
         import requests
-        import re
         chat_history = chat_history or []
         # Build a simple retrieval query from history similar to chat_with_context
         user_msgs = [m.get("content", "") for m in chat_history if isinstance(m, dict) and m.get("role") == "user"]
@@ -515,23 +679,55 @@ class CombinedRAGChain:
             else:
                 documents = self._similarity_search_all(retrieval_query, k=1 if page_number is not None else k)
 
+        if not documents:
+            refusal = REFUSAL_TEXT
+            yield {"type": "token", "text": refusal}
+            yield {
+                "type": "final",
+                "answer": refusal,
+                "sources": [],
+                "context": "",
+                "query": query,
+                "retrieval_query": retrieval_query,
+                "show_sources": False,
+            }
+            return
+
+        if not _question_supported_by_context(query, documents):
+            refusal = REFUSAL_TEXT
+            yield {"type": "token", "text": refusal}
+            yield {
+                "type": "final",
+                "answer": refusal,
+                "sources": [],
+                "context": "",
+                "query": query,
+                "retrieval_query": retrieval_query,
+                "show_sources": False,
+            }
+            return
+
         context = self._format_context(documents)
         recent_turns = self._format_recent_turns(chat_history, max_messages=6)
         # Build a page-aware prompt for streaming if applicable
         page_aware_prompt = self._generate_prompt_combined(query, context, documents)
         use_page_summary = "Final page summary:" in page_aware_prompt
-        final_prompt = page_aware_prompt if use_page_summary else (
-            "You are NetSec Tutor, restricted to the provided Network Security context. "
-            "Answer ONLY using the retrieved snippets below. If not answerable from them, reply exactly: "
-            "\"I can only assist with content from the provided Network Security course materials.\"\n\n"
-            "Recent conversation:\n"
-            f"{recent_turns}\n\n"
-            "Retrieved knowledge base snippets:\n"
-            f"{context}\n\n"
-            "User's latest question (answer this):\n"
-            f"{query}\n\n"
-            "Final answer:"
-        )
+        if use_page_summary:
+            final_prompt = page_aware_prompt
+        else:
+            base_prompt = (
+                "You are NetSec Tutor, restricted to the provided Network Security context. "
+                "Answer ONLY using the retrieved snippets below. If not answerable from them, reply exactly: "
+                "\"I can only assist with content from the provided Network Security course materials.\"\n\n"
+                "Recent conversation:\n"
+                f"{recent_turns}\n\n"
+                "Retrieved knowledge base snippets:\n"
+                f"{context}\n\n"
+                "User's latest question (answer this):\n"
+                f"{query}\n\n"
+                "Final answer:"
+            )
+            final_prompt = _with_output_format(base_prompt)
 
         # Prepare sources early
         sources: List[Dict[str, Any]] = []
@@ -554,13 +750,6 @@ class CombinedRAGChain:
                 "content_preview": (doc.page_content[:200] + "...") if len(doc.page_content) > 200 else doc.page_content,
             })
 
-        # If no context found, stream a refusal per guardrails
-        if not documents:
-            refusal = "I can only assist with content from the provided Network Security course materials."
-            yield {"type": "token", "text": refusal}
-            yield {"type": "final", "answer": refusal, "sources": [], "context": context, "query": query, "retrieval_query": retrieval_query}
-            return
-
         # Stream from Ollama generate endpoint
         url = f"{Config.OLLAMA_BASE_URL}/api/generate"
         payload = {
@@ -571,10 +760,13 @@ class CombinedRAGChain:
                 "temperature": Config.OLLAMA_TEMPERATURE
             }
         }
+        control_buffer = ""
+        control_parsed = False
+        show_sources_flag = True
+        answer_chunks: List[str] = []
         try:
             with requests.post(url, json=payload, stream=True) as r:
                 r.raise_for_status()
-                full: List[str] = []
                 for line in r.iter_lines(decode_unicode=True):
                     if not line:
                         continue
@@ -586,11 +778,30 @@ class CombinedRAGChain:
                         break
                     chunk = obj.get("response") or obj.get("data") or ""
                     if chunk:
-                        full.append(chunk)
+                        if not control_parsed:
+                            control_buffer += chunk
+                            parsed = _consume_control_prefix(control_buffer)
+                            if parsed:
+                                show_sources_flag, consumed_idx = parsed
+                                remainder = control_buffer[consumed_idx:]
+                                if remainder:
+                                    answer_chunks.append(remainder)
+                                    yield {"type": "token", "text": remainder}
+                                control_parsed = True
+                                control_buffer = ""
+                            continue
+                        answer_chunks.append(chunk)
                         yield {"type": "token", "text": chunk}
-                answer = "".join(full).strip()
+                if not control_parsed and control_buffer:
+                    control_parsed = True
+                    remainder = control_buffer
+                    if remainder:
+                        answer_chunks.append(remainder)
+                        yield {"type": "token", "text": remainder}
+                answer = "".join(answer_chunks).strip()
         except Exception as e:
             answer = f"[Streaming error: {e}]"
+            show_sources_flag = False
         yield {
             "type": "final",
             "answer": answer,
@@ -598,6 +809,7 @@ class CombinedRAGChain:
             "context": context,
             "query": query,
             "retrieval_query": retrieval_query,
+            "show_sources": show_sources_flag,
         }
 
     def _generate_prompt_combined(self, query: str, context: str, documents: List[Document]) -> str:
@@ -635,7 +847,7 @@ class CombinedRAGChain:
             note = ""
             if req_page != used_page:
                 note = f"(Requested page {req_page}, summarizing nearest available page {used_page}.)\n\n"
-            return (
+            return _with_output_format(
                 "You are NetSec Tutor, restricted to the provided Network Security materials.\n"
                 "Summarize ONLY the specified page from the context. Do NOT use outside knowledge. If the page content is not present, reply exactly: "
                 "\"I can only assist with content from the provided Network Security course materials.\"\n\n"
@@ -702,7 +914,6 @@ class CombinedRAGChain:
 
     def chat_with_context(self, query: str, chat_history: Optional[List[Dict]] = None, k: int = 4) -> Dict[str, Any]:
         try:
-            import re
             chat_history = chat_history or []
             # Simple history-aware rewrite similar to RAGChain
             user_msgs = [m.get("content", "") for m in chat_history if isinstance(m, dict) and m.get("role") == "user"]
@@ -769,14 +980,24 @@ class CombinedRAGChain:
                         documents = []
                 else:
                     documents = self._similarity_search_all(retrieval_query, k=1 if page_number is not None else k)
+            if not documents or not _question_supported_by_context(query, documents):
+                return {
+                    "answer": REFUSAL_TEXT,
+                    "sources": [],
+                    "context": "",
+                    "query": query,
+                    "retrieval_query": retrieval_query,
+                    "show_sources": False,
+                }
+
             context = self._format_context(documents)
             recent_turns = self._format_recent_turns(chat_history, max_messages=6)
             # Prefer page-summary prompt if page intent detected
             page_aware_prompt = self._generate_prompt_combined(query, context, documents)
             if "Final page summary:" in page_aware_prompt:
-                answer = self.model.invoke(page_aware_prompt)
+                raw_answer = self.model.invoke(page_aware_prompt)
             else:
-                final_prompt = (
+                base_prompt = (
                     "You are NetSec Tutor, restricted to the provided Network Security context. "
                     "Answer ONLY using the retrieved snippets below. If not answerable from them, reply exactly: "
                     "\"I can only assist with content from the provided Network Security course materials.\"\n\n"
@@ -788,7 +1009,9 @@ class CombinedRAGChain:
                     f"{query}\n\n"
                     "Final answer:"
                 )
-                answer = self.model.invoke(final_prompt)
+                final_prompt = _with_output_format(base_prompt)
+                raw_answer = self.model.invoke(final_prompt)
+            show_sources, answer = _split_structured_answer(raw_answer)
 
             sources: List[Dict[str, Any]] = []
             for doc in documents:
@@ -816,6 +1039,7 @@ class CombinedRAGChain:
                 "context": context,
                 "query": query,
                 "retrieval_query": retrieval_query,
+                "show_sources": show_sources,
             }
         except Exception as e:
             return {
@@ -823,4 +1047,5 @@ class CombinedRAGChain:
                 "sources": [],
                 "context": "",
                 "query": query,
+                "show_sources": False,
             }

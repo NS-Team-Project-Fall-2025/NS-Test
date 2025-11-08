@@ -120,7 +120,7 @@ export default function TutorPage() {
     const submissionHistory = [...baseHistory, { role: "user", content: question }];
 
     const userMessage = { role: "user", content: question };
-    const assistantMessage = { role: "assistant", content: "", sources: [], streaming: true };
+    const assistantMessage = { role: "assistant", content: "", sources: [], streaming: true, showSources: true };
 
     setMessages((prev) => [...prev, userMessage, assistantMessage]);
     setStreaming(true);
@@ -143,6 +143,7 @@ export default function TutorPage() {
               return next;
             });
           } else if (event.type === "final") {
+            const showSources = event.show_sources !== false;
             setMessages((prev) => {
               const next = [...prev];
               const last = next[next.length - 1];
@@ -150,6 +151,7 @@ export default function TutorPage() {
                 last.content = event.answer || last.content;
                 last.sources = event.sources || [];
                 last.streaming = false;
+                last.showSources = showSources;
               }
               return next;
             });
@@ -270,7 +272,7 @@ export default function TutorPage() {
                   </span>
                 )}
               </div>
-              {message.sources && message.sources.length > 0 && !message.streaming && (
+              {message.sources && message.sources.length > 0 && message.showSources !== false && !message.streaming && (
                 <div className="chat-sources">
                   <div className="chat-sources-header">Sources ({message.sources.length}):</div>
                   {message.sources.map((source, idx) => {
