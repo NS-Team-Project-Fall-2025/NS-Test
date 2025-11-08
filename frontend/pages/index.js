@@ -257,23 +257,37 @@ export default function TutorPage() {
           {messages.map((message, index) => (
             <div
               key={`${message.role}-${index}-${message.content.slice(0, 5)}`}
-              className={`chat-bubble ${message.role}`}
+              className={`chat-bubble ${message.role} ${message.streaming ? "streaming" : ""}`}
             >
               <h4>{message.role === "user" ? "You" : "NetSec Tutor"}</h4>
-              <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>{message.content}</div>
-              {message.sources && message.sources.length > 0 && (
+              <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
+                {message.content}
+                {message.streaming && (
+                  <span className="typing-indicator">
+                    <span className="typing-dot"></span>
+                    <span className="typing-dot"></span>
+                    <span className="typing-dot"></span>
+                  </span>
+                )}
+              </div>
+              {message.sources && message.sources.length > 0 && !message.streaming && (
                 <div className="chat-sources">
-                  {message.sources.map((source, idx) => (
-                    <div key={idx} className="chat-source">
-                      <strong>{source.filename || "Unknown source"}</strong>
-                      {source.page_number ? <span> · page {source.page_number}</span> : null}
-                      {source.content_preview ? (
-                        <div className="list-muted" style={{ marginTop: "0.35rem" }}>
-                          {source.content_preview}
-                        </div>
-                      ) : null}
-                    </div>
-                  ))}
+                  <div className="chat-sources-header">Sources ({message.sources.length}):</div>
+                  {message.sources.map((source, idx) => {
+                    // Ensure source is an object with proper structure
+                    const sourceObj = typeof source === 'object' && source !== null ? source : {};
+                    return (
+                      <div key={idx} className="chat-source">
+                        <strong>{sourceObj.filename || sourceObj.source || "Unknown source"}</strong>
+                        {sourceObj.page_number ? <span> · page {sourceObj.page_number}</span> : null}
+                        {sourceObj.content_preview ? (
+                          <div className="list-muted" style={{ marginTop: "0.35rem" }}>
+                            {sourceObj.content_preview}
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>

@@ -29,7 +29,16 @@ export default function Layout({ children }) {
               const isActive = mounted && router.pathname === item.href;
               return (
                 <li key={item.href} className={isActive ? "active" : ""}>
-                  <Link href={item.href}>{item.label}</Link>
+                  <Link 
+                    href={item.href}
+                    onClick={(e) => {
+                      if (isActive) {
+                        e.preventDefault();
+                      }
+                    }}
+                  >
+                    {item.label}
+                  </Link>
                 </li>
               );
             })}
