@@ -259,7 +259,28 @@ class QuizAgent:
                 break
 
         if not collected:
-            raise ValueError("Unable to retrieve any context from the knowledge base.")
+            # Check if vector stores are empty
+            store_info = []
+            for store in self.vector_stores:
+                try:
+                    info = store.get_collection_info()
+                    count = info.get("count", 0)
+                    store_info.append(f"{count} documents")
+                except Exception:
+                    store_info.append("unknown")
+            
+            raise ValueError(
+                "Unable to retrieve any context from the knowledge base. "
+                "This usually means:\n"
+                "1. No documents have been uploaded to the knowledge base yet, OR\n"
+                "2. The vector stores have not been built/rebuilt after uploading documents.\n\n"
+                f"Vector store status: {', '.join(store_info) if store_info else 'No stores available'}.\n\n"
+                "To fix this:\n"
+                "1. Go to the Knowledge Base page\n"
+                "2. Upload some documents (PDF, DOCX, or TXT files)\n"
+                "3. Click 'Ingest' to build the vector stores\n"
+                "4. Try generating a quiz again"
+            )
 
         source_map: Dict[str, Dict[str, Any]] = {}
         for idx, entry in enumerate(collected, start=1):
@@ -343,11 +364,30 @@ class QuizAgent:
             "temperature": self.temperature,
             "stream": False,
         }
-        response = requests.post(f"{self.base_url}/api/generate", json=payload, timeout=120)
-        response.raise_for_status()
-        data = response.json()
-        text = data.get("response") or ""
-        return text.strip()
+        try:
+            response = requests.post(f"{self.base_url}/api/generate", json=payload, timeout=120)
+            response.raise_for_status()
+            data = response.json()
+            text = data.get("response") or ""
+            return text.strip()
+        except requests.exceptions.ConnectionError as e:
+            raise ConnectionError(
+                f"Failed to connect to Ollama at {self.base_url}. "
+                f"Please ensure Ollama is running and accessible. Error: {str(e)}"
+            ) from e
+        except requests.exceptions.HTTPError as e:
+            raise ValueError(
+                f"Ollama API error: {e.response.status_code} - {e.response.text}. "
+                f"Model '{self.model}' may not be available. "
+                f"Try running: ollama pull {self.model}"
+            ) from e
+        except requests.exceptions.Timeout as e:
+            raise TimeoutError(
+                f"Ollama request timed out after 120 seconds. "
+                f"The model may be too slow or the request too large."
+            ) from e
+        except Exception as e:
+            raise RuntimeError(f"Unexpected error calling Ollama: {str(e)}") from e
 
     def _parse_quiz_json(self, text: str) -> Dict[str, Any]:
         if not text:

@@ -384,7 +384,10 @@ def generate_quiz(request: HttpRequest) -> JsonResponse:
             source_categories=normalized_categories,
         )
     except Exception as exc:
-        return _json("POST", {"error": str(exc)}, status=500)
+        import traceback
+        error_msg = str(exc)
+        traceback.print_exc()  # Print full traceback to console
+        return _json("POST", {"error": error_msg}, status=500)
 
     return _json("POST", quiz)
 

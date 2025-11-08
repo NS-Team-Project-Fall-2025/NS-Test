@@ -9,11 +9,11 @@ except ImportError:
 import chromadb
 from typing import List, Optional
 from sentence_transformers import SentenceTransformer
-from langchain.schema import Document
-from langchain.embeddings import SentenceTransformerEmbeddings
-from langchain.vectorstores import Chroma
+from langchain_core.documents import Document
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
 import numpy as np
-from langchain.schema import Document as LCDocument
+from langchain_core.documents import Document as LCDocument
 
 class VectorStore:
     def __init__(self, 
@@ -21,7 +21,7 @@ class VectorStore:
                  persist_directory: str = "vectorstore"):
         self.embedding_model_name = embedding_model
         self.persist_directory = persist_directory
-        self.embeddings = SentenceTransformerEmbeddings(
+        self.embeddings = HuggingFaceEmbeddings(
             model_name=embedding_model
         )
         self.vectorstore = None
@@ -37,7 +37,6 @@ class VectorStore:
             persist_directory=self.persist_directory,
             collection_name="rag_collection"
         )
-        self.vectorstore.persist()
     
     def load_vectorstore(self) -> bool:
         """Load existing vector store."""
@@ -58,7 +57,6 @@ class VectorStore:
             self.create_vectorstore(documents)
         else:
             self.vectorstore.add_documents(documents)
-            self.vectorstore.persist()
     
     def similarity_search(self, 
                          query: str, 

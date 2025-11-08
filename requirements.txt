@@ -10,4 +10,6 @@ chromadb
 langchain
 langchain-community
 langchain-ollama
+langchain-chroma
+langchain-huggingface
 

@@ -1,6 +1,6 @@
 from typing import List, Dict, Any, Optional, Sequence
-from langchain.schema import Document
-from langchain_community.llms import Ollama
+from langchain_core.documents import Document
+from langchain_ollama import OllamaLLM
 from .vector_store import VectorStore
 from config import Config
 
@@ -11,7 +11,7 @@ class RAGChain:
     
     def setup_ollama(self):
         """Setup Ollama LLM."""
-        self.model = Ollama(
+        self.model = OllamaLLM(
             base_url=Config.OLLAMA_BASE_URL,
             model=Config.OLLAMA_MODEL,
             temperature=Config.OLLAMA_TEMPERATURE
@@ -433,7 +433,7 @@ class CombinedRAGChain:
     def __init__(self, vector_stores: Sequence[VectorStore]):
         self.vector_stores = [vs for vs in vector_stores if vs is not None]
         # Reuse Ollama config as in RAGChain
-        self.model = Ollama(
+        self.model = OllamaLLM(
             base_url=Config.OLLAMA_BASE_URL,
             model=Config.OLLAMA_MODEL,
             temperature=Config.OLLAMA_TEMPERATURE,
