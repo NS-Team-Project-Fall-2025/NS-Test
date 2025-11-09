@@ -33,10 +33,13 @@ from .services.quiz_store import (
     load_quiz_attempt,
     save_quiz_attempt,
 )
+from .logging_utils import get_app_logger
 from .services.summarizer import (
     ask_llm_summary_stream,
     handle_summarization_request,
 )
+
+logger = get_app_logger()
 
 
 # --------------------------------------------------------------------------- #
@@ -68,6 +71,13 @@ def _ensure_category(manager: KnowledgeBaseManager, category: str) -> str:
     if category not in manager.list_categories():
         raise ValueError(f"Unsupported category '{category}'. Valid options: {manager.list_categories()}")
     return category
+
+
+def _shorten(text: str, max_len: int = 160) -> str:
+    cleaned = (text or "").replace("\n", " ").strip()
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[:max_len] + "..."
 
 
 # --------------------------------------------------------------------------- #
@@ -260,20 +270,31 @@ def tutor_chat_stream(request: HttpRequest) -> HttpResponse:
     if not isinstance(history, list):
         return _json("POST", {"error": "history must be a list."}, status=400)
     mode = payload.get("mode")
+    short_question = _shorten(question)
+    logger.info("tutor_chat_stream request question='%s' mode='%s'", short_question, mode or "combined")
     rag_service = get_rag_service()
     try:
         chain, stores = rag_service.get_chain(mode)
     except ValueError as exc:
+        logger.warning("tutor_chat_stream invalid mode='%s': %s", mode, exc)
         return _json("POST", {"error": str(exc)}, status=400)
+    logger.info(
+        "tutor_chat_stream using chain=%s store_count=%d",
+        chain.__class__.__name__,
+        len(stores),
+    )
 
     def _stream():
+        logger.info("tutor_chat_stream stream open question='%s'", short_question)
         try:
             generator = chain.chat_with_context_stream(question, chat_history=history)
         except AttributeError:
+            logger.warning("tutor_chat_stream chain lacks streaming, falling back to non-stream response")
             # Fallback to non-streaming response.
             try:
                 result = chain.chat_with_context(question, chat_history=history)
             except Exception as exc:  # pragma: no cover - network
+                logger.exception("tutor_chat_stream fallback error: %s", exc)
                 yield json.dumps({"type": "error", "error": str(exc)}) + "\n"
                 return
             result["type"] = "final"
@@ -283,6 +304,7 @@ def tutor_chat_stream(request: HttpRequest) -> HttpResponse:
             for event in generator:
                 yield json.dumps(event) + "\n"
         except Exception as exc:  # pragma: no cover - network
+            logger.exception("tutor_chat_stream streaming generator error: %s", exc)
             yield json.dumps({"type": "error", "error": str(exc)}) + "\n"
 
     response = StreamingHttpResponse(_stream(), content_type="application/x-ndjson")

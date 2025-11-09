@@ -4,17 +4,13 @@ from typing import List, Dict, Any, Optional, Sequence, Tuple
 from langchain_core.documents import Document
 from langchain_ollama import OllamaLLM
 from .vector_store import VectorStore
-from config import Config
-
-OUTPUT_FORMAT_INSTRUCTIONS = (
-    "\nOutput formatting requirements:\n"
-    "1. The very first line must be a single-line JSON object containing a boolean field named \"show_sources\" "
-    '(example: {"show_sources": true}).\n'
-    "   - Use true when your answer is grounded in the provided context snippets.\n"
-    "   - Use false only when you must refuse because the answer is not present in the provided context.\n"
-    "2. After a blank line, write the natural-language answer exactly as it should appear to the user.\n"
-    "3. Do not emit any other JSON or text before the JSON control line.\n"
+from .prompts import (
+    build_page_summary_prompt,
+    build_strict_qa_prompt,
+    build_conversation_prompt,
 )
+from config import Config
+from ..logging_utils import get_app_logger
 
 REFUSAL_TEXT = "I can only assist with content from the provided Network Security course materials."
 _STOP_WORDS = {
@@ -50,29 +46,36 @@ _STOP_WORDS = {
     "please",
 }
 
+logger = get_app_logger()
 
-def _with_output_format(prompt: str) -> str:
-    """Append the standardized output-format instructions to a prompt."""
-    return f"{prompt}{OUTPUT_FORMAT_INSTRUCTIONS}"
+
+def _decode_leading_json(text: str) -> Optional[Tuple[Dict[str, Any], int]]:
+    """Decode the first JSON object at the start of text, returning (object, absolute_end_index)."""
+    stripped = text.lstrip()
+    if not stripped.startswith("{"):
+        return None
+    offset = len(text) - len(stripped)
+    decoder = json.JSONDecoder()
+    try:
+        obj, relative_end = decoder.raw_decode(stripped)
+    except Exception:
+        return None
+    end_idx = offset + relative_end
+    # consume trailing blank lines after the JSON object
+    while end_idx < len(text) and text[end_idx] in "\r\n":
+        end_idx += 1
+    return obj, end_idx
 
 
 def _split_structured_answer(raw: Any) -> Tuple[bool, str]:
     """Split a model response into (show_sources, answer_text) according to the control JSON header."""
-    if not isinstance(raw, str):
-        text = str(raw)
-    else:
-        text = raw
-    stripped = text.lstrip()
-    newline_idx = stripped.find("\n")
-    if not stripped.startswith("{") or newline_idx == -1:
+    text = raw if isinstance(raw, str) else str(raw)
+    decoded = _decode_leading_json(text)
+    if not decoded:
         return True, text.strip()
-    header_line = stripped[:newline_idx].strip()
-    try:
-        header = json.loads(header_line)
-    except Exception:
-        return True, text.strip()
+    header, end_idx = decoded
     show_sources = bool(header.get("show_sources", True))
-    body = stripped[newline_idx + 1 :].lstrip("\r\n")
+    body = text[end_idx:].lstrip()
     return show_sources, body.strip()
 
 
@@ -80,25 +83,20 @@ def _consume_control_prefix(buffer: str) -> Optional[Tuple[bool, int]]:
     """Attempt to parse the control JSON from the beginning of a streaming buffer.
 
     Returns (show_sources, end_index) if successful, where end_index is the position in the original buffer
-    immediately after the JSON line and any trailing blank lines.
+    immediately after the JSON object and any trailing blank lines.
     """
-    stripped = buffer.lstrip()
-    if not stripped.startswith("{"):
+    decoded = _decode_leading_json(buffer)
+    if not decoded:
         return None
-    newline_idx = stripped.find("\n")
-    if newline_idx == -1:
-        return None
-    header_line = stripped[:newline_idx].strip()
-    try:
-        header = json.loads(header_line)
-    except Exception:
-        return None
-    show_sources = bool(header.get("show_sources", True))
-    offset = len(buffer) - len(stripped)
-    end_idx = offset + newline_idx + 1
-    while end_idx < len(buffer) and buffer[end_idx] in "\r\n":
-        end_idx += 1
-    return show_sources, end_idx
+    header, end_idx = decoded
+    return bool(header.get("show_sources", True)), end_idx
+
+
+def _shorten(text: str, max_len: int = 200) -> str:
+    cleaned = (text or "").replace("\n", " ").strip()
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[:max_len] + "..."
 
 
 def _extract_query_keywords(text: str) -> List[str]:
@@ -137,6 +135,8 @@ class RAGChain:
         """Retrieve relevant documents for the query.
         Supports explicit page-focused queries like: "Summarize/Explain/Describe Page 135 from Network Security Essentials".
         """
+        short_query = _shorten(query)
+        logger.info("RAGChain.retrieve_documents start query='%s'", short_query)
         # Detect page-focused intent
         m = re.search(
             r"(?:summari[sz]e|explain|describe|discuss|what(?:'s| is)?\s+on)\s+(?:the\s+)?page\s*(\d+)"
@@ -159,6 +159,11 @@ class RAGChain:
             # Optionally detect textbook name hint
             name_match = re.search(r"from\s+([^\n]+?)(?:\s+textbook|$)", query, re.IGNORECASE)
             name_hint = name_match.group(1).strip() if name_match else None
+            logger.info(
+                "RAGChain.retrieve_documents detected page intent page=%s hint='%s'",
+                page_number,
+                name_hint or "",
+            )
             # Fetch exact or nearest page document from vector store
             candidates = [0, -1, 1, -2, 2]
             for off in candidates:
@@ -170,6 +175,11 @@ class RAGChain:
                 except Exception:
                     page_docs = []
                 if page_docs:
+                    logger.info(
+                        "RAGChain.retrieve_documents returning page match page=%s count=%d",
+                        pn,
+                        len(page_docs),
+                    )
                     return page_docs
             # If page intent but not found, constrain similarity to top-1 to avoid mixing many pages
             if name_hint:
@@ -179,10 +189,22 @@ class RAGChain:
                     filtered = self.vector_store.similarity_search_filename_contains(query, k=1, filename_contains=name_hint)  # type: ignore[attr-defined]
                 except Exception:
                     filtered = []
+                logger.info(
+                    "RAGChain.retrieve_documents fallback to hinted similarity count=%d hint='%s'",
+                    len(filtered),
+                    name_hint,
+                )
                 return filtered
-            return self.vector_store.similarity_search(query, k=1)
+            docs = self.vector_store.similarity_search(query, k=1)
+            logger.info(
+                "RAGChain.retrieve_documents fallback to semantic top-1 count=%d",
+                len(docs),
+            )
+            return docs
         # Default semantic retrieval
-        return self.vector_store.similarity_search(query, k=k)
+        docs = self.vector_store.similarity_search(query, k=k)
+        logger.info("RAGChain.retrieve_documents returning %d docs", len(docs))
+        return docs
     
     def format_context(self, documents: List[Document]) -> str:
         """Format retrieved documents into context string with page numbers when available."""
@@ -239,42 +261,15 @@ class RAGChain:
             note = ""
             if req_page != used_page:
                 note = f"(Requested page {req_page}, summarizing nearest available page {used_page}.)\n\n"
-            prompt = (
-                "You are NetSec Tutor, restricted to the provided Network Security materials.\n"
-                "Summarize ONLY the specified page from the context. Do NOT use outside knowledge. If the page content is not present, reply exactly: "
-                "\"I can only assist with content from the provided Network Security course materials.\"\n\n"
-                f"Target: {used_filename or 'Unknown source'} — page {used_page}.\n"
-                f"{note}"
-                "Provide a concise, structured summary with the following sections (omit a section if not applicable):\n"
-                "- Key points (bullets)\n"
-                "- Important terms/definitions (term: definition)\n"
-                "- Examples or figures mentioned\n"
-                "- Equations or formulas (if any)\n"
-                "- Practical takeaways\n\n"
-                f"Context (page text):\n{context}\n\n"
-                f"User request:\n{query}\n\n"
-                "Final page summary:"
+            return build_page_summary_prompt(
+                context=context,
+                query=query,
+                used_filename=used_filename,
+                used_page=used_page,
+                note=note,
             )
-            return _with_output_format(prompt)
 
-        # Default QA template
-        prompt = f"""You are NetSec Tutor, an expert assistant restricted to the provided Network Security materials.
-
-Strict rules:
-- Answer ONLY using the Context. If the Context does not contain the answer, reply exactly: "I can only assist with content from the provided Network Security course materials."
-- Do NOT use outside knowledge. Do NOT hallucinate. If unsure, refuse.
-- If asked to summarize a page, provide a concise summary of ONLY that page.
-- Keep the answer precise and well-structured.
-
-Context:
-{context}
-
-User question:
-{query}
-
-Final answer (follow the rules):
-"""
-        return _with_output_format(prompt)
+        return build_strict_qa_prompt(context=context, query=query)
     
     def _extract_last_user_questions(self, chat_history: Optional[List[Dict]]) -> List[str]:
         """Extract user messages from history, return last two before the most recent user message.
@@ -329,26 +324,28 @@ Final answer (follow the rules):
     
     def _build_final_prompt(self, latest_question: str, context: str, recent_turns: str) -> str:
         """Build the final multi-part prompt for the LLM."""
-        return _with_output_format(
-            "You are NetSec Tutor, restricted to the provided Network Security context. "
-            "Answer ONLY using the retrieved snippets below. If not answerable from them, reply exactly: "
-            "\"I can only assist with content from the provided Network Security course materials.\"\n\n"
-            "Recent conversation:\n"
-            f"{recent_turns}\n\n"
-            "Retrieved knowledge base snippets:\n"
-            f"{context}\n\n"
-            "User's latest question (answer this):\n"
-            f"{latest_question}\n\n"
-            "Final answer:"
+        return build_conversation_prompt(
+            recent_turns=recent_turns,
+            context=context,
+            latest_question=latest_question,
         )
     
     def generate_answer(self, query: str, k: int = 4) -> Dict[str, Any]:
         """Generate answer using RAG pipeline (single-turn)."""
         try:
+            short_query = _shorten(query)
+            logger.info("generate_answer start query='%s'", short_query)
             # Step 1: Retrieve relevant documents
             documents = self.retrieve_documents(query, k=k)
+            logger.info("generate_answer retrieved %d docs", len(documents))
             
+            logger.info(
+                "CombinedRAGChain.chat_with_context documents_found=%d for query='%s'",
+                len(documents),
+                _shorten(retrieval_query),
+            )
             if not documents:
+                logger.info("generate_answer refusing due to missing documents")
                 return {
                     "answer": REFUSAL_TEXT,
                     "sources": [],
@@ -358,6 +355,7 @@ Final answer (follow the rules):
                 }
 
             if not _question_supported_by_context(query, documents):
+                logger.info("generate_answer refusing due to unsupported context")
                 return {
                     "answer": REFUSAL_TEXT,
                     "sources": [],
@@ -373,8 +371,10 @@ Final answer (follow the rules):
             prompt = self.generate_prompt(query, context, documents)
             
             # Step 4: Get response from Ollama
+            logger.info("generate_answer invoking model")
             response = self.model.invoke(prompt)
             show_sources, answer = _split_structured_answer(response)
+            logger.info("generate_answer completed show_sources=%s", show_sources)
             
             # Step 5: Extract sources
             sources = []
@@ -418,11 +418,19 @@ Final answer (follow the rules):
     def chat_with_context(self, query: str, chat_history: List[Dict] = None, k: int = 4) -> Dict[str, Any]:
         """Conversational RAG with history-aware retrieval and grounded answering."""
         try:
+            short_query = _shorten(query)
+            logger.info("chat_with_context start query='%s'", short_query)
             chat_history = chat_history or []
             last_two = self._extract_last_user_questions(chat_history)
             combined_retrieval_query = self._rewrite_retrieval_query(last_two, query)
             documents = self.retrieve_documents(combined_retrieval_query, k=k)
+            logger.info(
+                "chat_with_context retrieved %d docs using query='%s'",
+                len(documents),
+                _shorten(combined_retrieval_query),
+            )
             if not documents or not _question_supported_by_context(query, documents):
+                logger.info("chat_with_context refusing due to insufficient context")
                 return {
                     "answer": REFUSAL_TEXT,
                     "sources": [],
@@ -437,11 +445,14 @@ Final answer (follow the rules):
             page_aware_prompt = self.generate_prompt(query, context, documents)
             # Heuristic: if page-aware prompt is a summary prompt (it contains 'Final page summary:'), use it
             if "Final page summary:" in page_aware_prompt:
+                logger.info("chat_with_context using page summary prompt")
                 raw_answer = self.model.invoke(page_aware_prompt)
             else:
                 final_prompt = self._build_final_prompt(query, context, recent_turns)
+                logger.info("chat_with_context using conversation prompt")
                 raw_answer = self.model.invoke(final_prompt)
             show_sources, answer = _split_structured_answer(raw_answer)
+            logger.info("chat_with_context completed show_sources=%s", show_sources)
             sources = []
             for doc in documents:
                 src_path = doc.metadata.get('source') or ''
@@ -471,6 +482,7 @@ Final answer (follow the rules):
                 "show_sources": show_sources,
             }
         except Exception as e:
+            logger.exception("chat_with_context error: %s", e)
             return {
                 "answer": f"An error occurred while generating the answer: {str(e)}",
                 "sources": [],
@@ -484,12 +496,20 @@ Final answer (follow the rules):
         Yields dict events: {"type": "token", "text": str} and final: {"type": "final", ...}.
         """
         import requests
+        short_query = _shorten(query)
+        logger.info("chat_with_context_stream start query='%s'", short_query)
         chat_history = chat_history or []
         last_two = self._extract_last_user_questions(chat_history)
         combined_retrieval_query = self._rewrite_retrieval_query(last_two, query)
         documents = self.retrieve_documents(combined_retrieval_query, k=k)
+        logger.info(
+            "chat_with_context_stream retrieved %d docs using query='%s'",
+            len(documents),
+            _shorten(combined_retrieval_query),
+        )
         if not documents or not _question_supported_by_context(query, documents):
             refusal = REFUSAL_TEXT
+            logger.info("chat_with_context_stream refusing due to insufficient context")
             yield {"type": "token", "text": refusal}
             yield {
                 "type": "final",
@@ -507,6 +527,10 @@ Final answer (follow the rules):
         page_aware_prompt = self.generate_prompt(query, context, documents)
         use_page_summary = "Final page summary:" in page_aware_prompt
         final_prompt = page_aware_prompt if use_page_summary else self._build_final_prompt(query, context, recent_turns)
+        logger.info(
+            "chat_with_context_stream using prompt_type=%s",
+            "page_summary" if use_page_summary else "conversation",
+        )
 
         # Prepare sources early
         sources = []
@@ -579,6 +603,7 @@ Final answer (follow the rules):
                         yield {"type": "token", "text": remainder}
                 answer = "".join(answer_chunks).strip()
         except Exception as e:
+            logger.exception("chat_with_context_stream streaming error: %s", e)
             answer = f"[Streaming error: {e}]"
             show_sources_flag = False
         yield {
@@ -590,6 +615,7 @@ Final answer (follow the rules):
             "retrieval_query": combined_retrieval_query,
             "show_sources": show_sources_flag,
         }
+        logger.info("chat_with_context_stream completed show_sources=%s", show_sources_flag)
 
 
 class CombinedRAGChain:
@@ -611,6 +637,8 @@ class CombinedRAGChain:
         """
         import requests
         chat_history = chat_history or []
+        short_query = _shorten(query)
+        logger.info("CombinedRAGChain.chat_with_context_stream start query='%s'", short_query)
         # Build a simple retrieval query from history similar to chat_with_context
         user_msgs = [m.get("content", "") for m in chat_history if isinstance(m, dict) and m.get("role") == "user"]
         last_two = user_msgs[-3:-1] if len(user_msgs) > 1 else []
@@ -679,8 +707,15 @@ class CombinedRAGChain:
             else:
                 documents = self._similarity_search_all(retrieval_query, k=1 if page_number is not None else k)
 
+        logger.info(
+            "CombinedRAGChain.chat_with_context_stream documents_found=%d for query='%s'",
+            len(documents),
+            _shorten(retrieval_query),
+        )
+
         if not documents:
             refusal = REFUSAL_TEXT
+            logger.info("CombinedRAGChain.chat_with_context_stream refusing: no documents")
             yield {"type": "token", "text": refusal}
             yield {
                 "type": "final",
@@ -695,6 +730,7 @@ class CombinedRAGChain:
 
         if not _question_supported_by_context(query, documents):
             refusal = REFUSAL_TEXT
+            logger.info("CombinedRAGChain.chat_with_context_stream refusing: unsupported context")
             yield {"type": "token", "text": refusal}
             yield {
                 "type": "final",
@@ -715,19 +751,15 @@ class CombinedRAGChain:
         if use_page_summary:
             final_prompt = page_aware_prompt
         else:
-            base_prompt = (
-                "You are NetSec Tutor, restricted to the provided Network Security context. "
-                "Answer ONLY using the retrieved snippets below. If not answerable from them, reply exactly: "
-                "\"I can only assist with content from the provided Network Security course materials.\"\n\n"
-                "Recent conversation:\n"
-                f"{recent_turns}\n\n"
-                "Retrieved knowledge base snippets:\n"
-                f"{context}\n\n"
-                "User's latest question (answer this):\n"
-                f"{query}\n\n"
-                "Final answer:"
+            final_prompt = build_conversation_prompt(
+                recent_turns=recent_turns,
+                context=context,
+                latest_question=query,
             )
-            final_prompt = _with_output_format(base_prompt)
+        logger.info(
+            "CombinedRAGChain.chat_with_context_stream using prompt_type=%s",
+            "page_summary" if use_page_summary else "conversation",
+        )
 
         # Prepare sources early
         sources: List[Dict[str, Any]] = []
@@ -800,6 +832,7 @@ class CombinedRAGChain:
                         yield {"type": "token", "text": remainder}
                 answer = "".join(answer_chunks).strip()
         except Exception as e:
+            logger.exception("CombinedRAGChain.chat_with_context_stream streaming error: %s", e)
             answer = f"[Streaming error: {e}]"
             show_sources_flag = False
         yield {
@@ -811,6 +844,10 @@ class CombinedRAGChain:
             "retrieval_query": retrieval_query,
             "show_sources": show_sources_flag,
         }
+        logger.info(
+            "CombinedRAGChain.chat_with_context_stream completed show_sources=%s",
+            show_sources_flag,
+        )
 
     def _generate_prompt_combined(self, query: str, context: str, documents: List[Document]) -> str:
         """Generate a page-aware prompt for CombinedRAGChain similar to RAGChain.generate_prompt."""
@@ -847,21 +884,12 @@ class CombinedRAGChain:
             note = ""
             if req_page != used_page:
                 note = f"(Requested page {req_page}, summarizing nearest available page {used_page}.)\n\n"
-            return _with_output_format(
-                "You are NetSec Tutor, restricted to the provided Network Security materials.\n"
-                "Summarize ONLY the specified page from the context. Do NOT use outside knowledge. If the page content is not present, reply exactly: "
-                "\"I can only assist with content from the provided Network Security course materials.\"\n\n"
-                f"Target: {used_filename or 'Unknown source'} — page {used_page}.\n"
-                f"{note}"
-                "Provide a concise, structured summary with the following sections (omit a section if not applicable):\n"
-                "- Key points (bullets)\n"
-                "- Important terms/definitions (term: definition)\n"
-                "- Examples or figures mentioned\n"
-                "- Equations or formulas (if any)\n"
-                "- Practical takeaways\n\n"
-                f"Context (page text):\n{context}\n\n"
-                f"User request:\n{query}\n\n"
-                "Final page summary:"
+            return build_page_summary_prompt(
+                context=context,
+                query=query,
+                used_filename=used_filename,
+                used_page=used_page,
+                note=note,
             )
         # No page intent: return a generic placeholder, caller will build the default conversation prompt
         return ""
@@ -914,6 +942,8 @@ class CombinedRAGChain:
 
     def chat_with_context(self, query: str, chat_history: Optional[List[Dict]] = None, k: int = 4) -> Dict[str, Any]:
         try:
+            short_query = _shorten(query)
+            logger.info("CombinedRAGChain.chat_with_context start query='%s'", short_query)
             chat_history = chat_history or []
             # Simple history-aware rewrite similar to RAGChain
             user_msgs = [m.get("content", "") for m in chat_history if isinstance(m, dict) and m.get("role") == "user"]
@@ -981,6 +1011,7 @@ class CombinedRAGChain:
                 else:
                     documents = self._similarity_search_all(retrieval_query, k=1 if page_number is not None else k)
             if not documents or not _question_supported_by_context(query, documents):
+                logger.info("CombinedRAGChain.chat_with_context refusing due to insufficient context")
                 return {
                     "answer": REFUSAL_TEXT,
                     "sources": [],
@@ -995,23 +1026,18 @@ class CombinedRAGChain:
             # Prefer page-summary prompt if page intent detected
             page_aware_prompt = self._generate_prompt_combined(query, context, documents)
             if "Final page summary:" in page_aware_prompt:
+                logger.info("CombinedRAGChain.chat_with_context using page summary prompt")
                 raw_answer = self.model.invoke(page_aware_prompt)
             else:
-                base_prompt = (
-                    "You are NetSec Tutor, restricted to the provided Network Security context. "
-                    "Answer ONLY using the retrieved snippets below. If not answerable from them, reply exactly: "
-                    "\"I can only assist with content from the provided Network Security course materials.\"\n\n"
-                    "Recent conversation:\n"
-                    f"{recent_turns}\n\n"
-                    "Retrieved knowledge base snippets:\n"
-                    f"{context}\n\n"
-                    "User's latest question (answer this):\n"
-                    f"{query}\n\n"
-                    "Final answer:"
+                final_prompt = build_conversation_prompt(
+                    recent_turns=recent_turns,
+                    context=context,
+                    latest_question=query,
                 )
-                final_prompt = _with_output_format(base_prompt)
+                logger.info("CombinedRAGChain.chat_with_context using conversation prompt")
                 raw_answer = self.model.invoke(final_prompt)
             show_sources, answer = _split_structured_answer(raw_answer)
+            logger.info("CombinedRAGChain.chat_with_context completed show_sources=%s", show_sources)
 
             sources: List[Dict[str, Any]] = []
             for doc in documents:
@@ -1042,6 +1068,7 @@ class CombinedRAGChain:
                 "show_sources": show_sources,
             }
         except Exception as e:
+            logger.exception("CombinedRAGChain.chat_with_context error: %s", e)
             return {
                 "answer": f"An error occurred while generating the answer: {str(e)}",
                 "sources": [],

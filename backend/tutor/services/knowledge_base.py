@@ -11,6 +11,7 @@ from config import Config
 
 from .document_processor import DocumentProcessor
 from .vector_store import VectorStore
+from ..logging_utils import get_app_logger, summarize_text
 
 
 KBCategory = str
@@ -28,6 +29,7 @@ class KnowledgeBaseManager:
             chunk_overlap=Config.CHUNK_OVERLAP,
         )
         self._stores: Dict[KBCategory, VectorStore] = {}
+        self._logger = get_app_logger()
         self._init_categories()
 
     # ------------------------------------------------------------------ #
@@ -66,6 +68,12 @@ class KnowledgeBaseManager:
                         }
                     )
             result[cat] = items
+        total_files = sum(len(files) for files in result.values())
+        self._logger.info(
+            "KnowledgeBase.list_files categories=%s total_files=%d",
+            cats,
+            total_files,
+        )
         return result
 
     def ensure_vector_store(self, category: KBCategory) -> Optional[VectorStore]:
@@ -73,6 +81,7 @@ class KnowledgeBaseManager:
         cfg = self._category_config().get(category)
         if not cfg:
             return None
+        self._logger.info("KnowledgeBase.ensure_vector_store category=%s", category)
         with self._lock:
             store = self._stores.get(category)
             if store is None:
@@ -83,15 +92,30 @@ class KnowledgeBaseManager:
                 self._stores[category] = store
             try:
                 loaded = store.load_vectorstore()
-            except Exception:
+            except Exception as exc:
+                self._logger.exception(
+                    "KnowledgeBase.ensure_vector_store load failed category=%s: %s",
+                    category,
+                    exc,
+                )
                 loaded = False
             if loaded:
+                self._logger.info("KnowledgeBase.ensure_vector_store loaded existing store category=%s", category)
                 return store
             # Build from scratch if data exists
             documents, _ = self._collect_documents(cfg["data_dir"])
             if not documents:
+                self._logger.info(
+                    "KnowledgeBase.ensure_vector_store no documents available category=%s",
+                    category,
+                )
                 return store
             store.create_vectorstore(documents)
+            self._logger.info(
+                "KnowledgeBase.ensure_vector_store built store category=%s documents=%d",
+                category,
+                len(documents),
+            )
             return store
 
     def rebuild_vector_store(self, category: KBCategory) -> Optional[tuple[VectorStore, List[str]]]:
@@ -102,6 +126,7 @@ class KnowledgeBaseManager:
         cfg = self._category_config().get(category)
         if not cfg:
             return None
+        self._logger.info("KnowledgeBase.rebuild_vector_store start category=%s", category)
         documents, file_paths = self._collect_documents(cfg["data_dir"])
         with self._lock:
             store = self._stores.get(category)
@@ -114,6 +139,17 @@ class KnowledgeBaseManager:
             if documents:
                 store.delete_collection()
                 store.create_vectorstore(documents)
+                self._logger.info(
+                    "KnowledgeBase.rebuild_vector_store completed category=%s documents=%d files=%d",
+                    category,
+                    len(documents),
+                    len(file_paths),
+                )
+            else:
+                self._logger.info(
+                    "KnowledgeBase.rebuild_vector_store skipped (no documents) category=%s",
+                    category,
+                )
             return store, file_paths
 
     def get_vector_store(self, category: KBCategory) -> Optional[VectorStore]:
@@ -148,10 +184,16 @@ class KnowledgeBaseManager:
         # Recreate empty directories so later uploads succeed
         data_dir.mkdir(parents=True, exist_ok=True)
         vector_dir.mkdir(parents=True, exist_ok=True)
-        return {
+        summary = {
             "files_removed": removed_files,
             "vector_items_removed": removed_vectors,
         }
+        self._logger.info(
+            "KnowledgeBase.clear_category category=%s summary=%s",
+            category,
+            summary,
+        )
+        return summary
 
     def clear_all(self, categories: Optional[List[KBCategory]] = None) -> Dict[KBCategory, Dict[str, int]]:
         """Clear every requested category."""
@@ -162,19 +204,33 @@ class KnowledgeBaseManager:
             if not cfg:
                 continue
             result[cat] = self.clear_category(cat)
+        self._logger.info(
+            "KnowledgeBase.clear_all categories=%s",
+            cats,
+        )
         return result
 
     # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
     def _init_categories(self) -> None:
-        for cfg in self._category_config().values():
+        for name, cfg in self._category_config().items():
             Path(cfg["data_dir"]).mkdir(parents=True, exist_ok=True)
             Path(cfg["vector_dir"]).mkdir(parents=True, exist_ok=True)
+            self._logger.info(
+                "KnowledgeBase._init_categories ensured directories category=%s data_dir=%s vector_dir=%s",
+                name,
+                cfg["data_dir"],
+                cfg["vector_dir"],
+            )
 
     def _collect_documents(self, data_dir: str):
         folder = Path(data_dir)
         if not folder.is_dir():
+            self._logger.info(
+                "KnowledgeBase._collect_documents empty directory=%s",
+                data_dir,
+            )
             return [], []
         files = [
             str(path)
@@ -182,8 +238,18 @@ class KnowledgeBaseManager:
             if path.is_file() and path.suffix.lower() in self.SUPPORTED_EXTENSIONS
         ]
         if not files:
+            self._logger.info(
+                "KnowledgeBase._collect_documents no supported files directory=%s",
+                data_dir,
+            )
             return [], []
         documents = self._processor.process_multiple_documents(files)
+        self._logger.info(
+            "KnowledgeBase._collect_documents processed files=%d documents=%d directory=%s",
+            len(files),
+            len(documents),
+            data_dir,
+        )
         return documents, files
 
     @staticmethod

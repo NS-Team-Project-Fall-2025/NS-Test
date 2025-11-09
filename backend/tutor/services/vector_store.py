@@ -7,13 +7,16 @@ except ImportError:
     import sqlite3
 
 import chromadb
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from sentence_transformers import SentenceTransformer
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 import numpy as np
 from langchain_core.documents import Document as LCDocument
+from ..logging_utils import get_app_logger, summarize_text
+
+logger = get_app_logger()
 
 class VectorStore:
     def __init__(self, 
@@ -28,9 +31,15 @@ class VectorStore:
         
         # Create directory if it doesn't exist
         os.makedirs(persist_directory, exist_ok=True)
+        logger.info(
+            "VectorStore.init model=%s persist_directory=%s",
+            self.embedding_model_name,
+            self.persist_directory,
+        )
     
     def create_vectorstore(self, documents: List[Document]) -> None:
         """Create a new vector store from documents."""
+        logger.info("VectorStore.create_vectorstore documents=%d", len(documents))
         self.vectorstore = Chroma.from_documents(
             documents=documents,
             embedding=self.embeddings,
@@ -46,47 +55,96 @@ class VectorStore:
                 embedding_function=self.embeddings,
                 collection_name="rag_collection"
             )
+            logger.info("VectorStore.load_vectorstore success path=%s", self.persist_directory)
             return True
         except Exception as e:
-            print(f"Error loading vector store: {str(e)}")
+            logger.exception("VectorStore.load_vectorstore failed: %s", e)
             return False
     
     def add_documents(self, documents: List[Document]) -> None:
         """Add new documents to existing vector store."""
         if self.vectorstore is None:
+            logger.info("VectorStore.add_documents auto-create store")
             self.create_vectorstore(documents)
         else:
             self.vectorstore.add_documents(documents)
+            logger.info("VectorStore.add_documents appended=%d", len(documents))
+
+    def _ensure_store(self, method: str) -> bool:
+        if self.vectorstore is None:
+            logger.warning("VectorStore.%s attempted with empty store", method)
+            return False
+        return True
+
+    def _log_similarity_results(
+        self,
+        method: str,
+        query: str,
+        k: int,
+        results: List[Tuple[Document, Optional[float]]],
+        extra: Optional[str] = None,
+    ) -> None:
+        preview = summarize_text(query, 120)
+        snippet_parts = []
+        for doc, score in results[:5]:
+            meta = doc.metadata or {}
+            filename = meta.get("filename") or "Unknown"
+            page = meta.get("page_number")
+            label = f"{filename}{f'#{page}' if page else ''}"
+            formatted_score = "n/a" if score is None else f"{score:.4f}"
+            snippet_parts.append(f"{label}={formatted_score}")
+        snippet = "; ".join(snippet_parts) if snippet_parts else "no-results"
+        logger.info(
+            "VectorStore.%s query='%s' k=%d hits=%d %s samples=[%s]",
+            method,
+            preview,
+            k,
+            len(results),
+            extra or "",
+            snippet,
+        )
+
+    def _similarity_with_scores(
+        self,
+        method: str,
+        query: str,
+        k: int,
+    ) -> List[Tuple[Document, Optional[float]]]:
+        if not self._ensure_store(method):
+            return []
+        try:
+            scored = self.vectorstore.similarity_search_with_score(query, k=k)
+        except Exception as exc:
+            logger.exception("VectorStore.%s score retrieval failed, falling back: %s", method, exc)
+            docs = self.vectorstore.similarity_search(query, k=k)
+            scored = [(doc, None) for doc in docs]
+        self._log_similarity_results(method, query, k, scored)
+        return scored
     
     def similarity_search(self, 
                          query: str, 
                          k: int = 4) -> List[Document]:
         """Perform similarity search and return relevant documents."""
-        if self.vectorstore is None:
-            return []
-        
-        return self.vectorstore.similarity_search(query, k=k)
+        scored = self._similarity_with_scores("similarity_search", query, k)
+        return [doc for doc, _ in scored]
     
     def similarity_search_with_score(self, 
                                    query: str, 
                                    k: int = 4) -> List[tuple]:
         """Perform similarity search with scores."""
-        if self.vectorstore is None:
-            return []
-        
-        return self.vectorstore.similarity_search_with_score(query, k=k)
+        return self._similarity_with_scores("similarity_search_with_score", query, k)
 
     def similarity_search_filename_contains(self, query: str, k: int = 4, filename_contains: Optional[str] = None) -> List[Document]:
         """Similarity search but only keep results whose metadata.filename contains the given substring."""
-        if self.vectorstore is None:
+        if not self._ensure_store("similarity_search_filename_contains"):
             return []
         if not filename_contains:
             return self.similarity_search(query, k=k)
         # pull more candidates, then filter
-        candidates = self.similarity_search_with_score(query, k=max(k * 5, 10))
+        candidates = self._similarity_with_scores("similarity_search_filename_contains", query, max(k * 5, 10))
         needle = filename_contains.lower()
         filtered: List[Document] = []
-        for doc, _score in candidates:
+        for doc, score in candidates:
             try:
                 fn = (doc.metadata or {}).get("filename")
                 if fn and needle in fn.lower():
@@ -95,15 +153,24 @@ class VectorStore:
                 continue
             if len(filtered) >= k:
                 break
+        self._log_similarity_results(
+            "similarity_search_filename_contains.filtered",
+            query,
+            k,
+            [(doc, None) for doc in filtered],
+            extra=f"filter='{filename_contains}'",
+        )
         return filtered
 
     def similarity_search_with_score_filename_contains(self, query: str, k: int = 4, filename_contains: Optional[str] = None) -> List[tuple]:
         """Similarity search with scores filtered by filename substring."""
-        if self.vectorstore is None:
+        if not self._ensure_store("similarity_search_with_score_filename_contains"):
             return []
         if not filename_contains:
             return self.similarity_search_with_score(query, k=k)
-        candidates = self.similarity_search_with_score(query, k=max(k * 5, 10))
+        candidates = self._similarity_with_scores(
+            "similarity_search_with_score_filename_contains", query, max(k * 5, 10)
+        )
         needle = filename_contains.lower()
         filtered: List[tuple] = []
         for doc, score in candidates:
@@ -115,6 +182,13 @@ class VectorStore:
                 continue
             if len(filtered) >= k:
                 break
+        self._log_similarity_results(
+            "similarity_search_with_score_filename_contains.filtered",
+            query,
+            k,
+            filtered,
+            extra=f"filter='{filename_contains}'",
+        )
         return filtered
     
     def delete_collection(self) -> None:
@@ -122,6 +196,7 @@ class VectorStore:
         if self.vectorstore is not None:
             self.vectorstore.delete_collection()
             self.vectorstore = None
+            logger.info("VectorStore.delete_collection completed")
     
     def get_collection_info(self) -> dict:
         """Get information about the collection."""
@@ -131,9 +206,11 @@ class VectorStore:
         try:
             collection = self.vectorstore._collection
             count = collection.count()
-            return {"status": "Collection loaded", "count": count}
+            info = {"status": "Collection loaded", "count": count}
+            logger.info("VectorStore.get_collection_info count=%d", count)
+            return info
         except Exception as e:
-
+            logger.exception("VectorStore.get_collection_info error: %s", e)
             return {"status": f"Error: {str(e)}", "count": 0}
 
     def get_page_document(self, page_number: int, filename_contains: Optional[str] = None) -> List[LCDocument]:
@@ -141,7 +218,7 @@ class VectorStore:
         Returns a list with one Document if found, else empty list.
         Note: This bypasses vector similarity and reads the underlying collection.
         """
-        if self.vectorstore is None:
+        if not self._ensure_store("get_page_document"):
             return []
         try:
             collection = self.vectorstore._collection
@@ -167,8 +244,15 @@ class VectorStore:
                         break
                 except Exception:
                     continue
+            logger.info(
+                "VectorStore.get_page_document page=%s filter='%s' hits=%d",
+                page_number,
+                filename_contains or "",
+                len(results),
+            )
             return results
-        except Exception:
+        except Exception as exc:
+            logger.exception("VectorStore.get_page_document error page=%s: %s", page_number, exc)
             return []
     
     def retrieve_by_topics(self, topics: list, num_contexts: int = 10) -> list:
@@ -192,5 +276,11 @@ class VectorStore:
                 seen.add(c)
             if len(unique_results) >= num_contexts:
                 break
+        logger.info(
+            "VectorStore.retrieve_by_topics topics=%d unique_contexts=%d limit=%d",
+            len(topics),
+            len(unique_results),
+            num_contexts,
+        )
         return unique_results
 

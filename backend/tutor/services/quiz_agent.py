@@ -8,6 +8,10 @@ import requests
 
 from config import Config
 from .vector_store import VectorStore
+from .prompts import build_quiz_generation_prompt
+from ..logging_utils import get_app_logger, summarize_text
+
+logger = get_app_logger()
 
 
 class QuizAgent:
@@ -75,15 +79,31 @@ class QuizAgent:
             raise ValueError("At least one question must be requested.")
         if total_questions > 15:
             raise ValueError("Please request 15 or fewer total questions per quiz.")
+        logger.info(
+            "QuizAgent.generate_quiz start mode=%s difficulty=%s counts={'mcq':%d,'tf':%d,'open':%d}",
+            mode,
+            difficulty,
+            num_mcq,
+            num_true_false,
+            num_open_ended,
+        )
 
         topics_clean = self._prepare_topics(topics, mode)
+        logger.info("QuizAgent.generate_quiz topics=%s", topics_clean)
         difficulty_clean = (difficulty or "medium").strip().lower()
         if difficulty_clean not in {"easy", "medium", "hard"}:
             difficulty_clean = "medium"
         source_map = self._gather_contexts(topics_clean, total_chunks=max(6, total_questions * 2))
         context_prompt = self._format_context_for_prompt(source_map)
+        logger.info("QuizAgent.generate_quiz gathered_contexts=%d", len(source_map))
 
-        prompt = self._build_generation_prompt(
+        logger.info(
+            "QuizAgent.generate_quiz building prompt topics=%d difficulty=%s context_chars=%d",
+            len(topics_clean),
+            difficulty_clean,
+            len(context_prompt),
+        )
+        prompt = build_quiz_generation_prompt(
             context_prompt=context_prompt,
             num_mcq=num_mcq,
             num_true_false=num_true_false,
@@ -92,8 +112,11 @@ class QuizAgent:
             difficulty=difficulty_clean,
         )
 
+        logger.info("QuizAgent.generate_quiz invoking LLM prompt_chars=%d", len(prompt))
         llm_response = self._call_llm(prompt)
+        logger.info("QuizAgent.generate_quiz llm_response_chars=%d", len(llm_response))
         quiz_payload = self._parse_quiz_json(llm_response)
+        logger.info("QuizAgent.generate_quiz parsed_questions=%d", len(quiz_payload.get("questions", [])))
 
         expected_counts = {
             "multiple_choice": num_mcq,
@@ -146,6 +169,7 @@ class QuizAgent:
             "difficulty": difficulty_clean,
             "source_categories": list(source_categories) if source_categories else ["textbooks", "slides"],
         }
+        logger.info("QuizAgent.generate_quiz complete title='%s' counts=%s", quiz_data["title"], final_counts)
         return quiz_data
 
     def grade_quiz(self, quiz_data: Dict[str, Any], user_answers: Dict[str, Any]) -> Dict[str, Any]:
@@ -155,6 +179,11 @@ class QuizAgent:
         if not questions:
             raise ValueError("Quiz data contains no questions.")
 
+        logger.info(
+            "QuizAgent.grade_quiz start questions=%d answers=%d",
+            len(questions),
+            len(user_answers or {}),
+        )
         graded_questions = []
         earned_score = 0.0
         max_score = float(len(questions))
@@ -199,6 +228,12 @@ class QuizAgent:
             "max_score": max_score,
             "percentage": percentage,
         }
+        logger.info(
+            "QuizAgent.grade_quiz complete earned=%.2f/%d percentage=%.2f",
+            earned_score,
+            len(questions),
+            percentage,
+        )
         return grading_summary
 
     # ------------------------------------------------------------------ #
@@ -225,8 +260,10 @@ class QuizAgent:
             for store in self.vector_stores:
                 try:
                     docs = store.similarity_search(topic, k=chunks_per_topic)
-                except Exception:
+                except Exception as exc:
+                    logger.exception("QuizAgent._gather_contexts similarity error topic='%s': %s", topic, exc)
                     docs = []
+                added = 0
                 for doc in docs:
                     metadata = doc.metadata or {}
                     key = (
@@ -253,8 +290,16 @@ class QuizAgent:
                     )
                     if len(collected) >= total_chunks:
                         break
+                    added += 1
                 if len(collected) >= total_chunks:
                     break
+            logger.info(
+                "QuizAgent._gather_contexts topic='%s' added=%d total=%d/%d",
+                topic,
+                added,
+                len(collected),
+                total_chunks,
+            )
             if len(collected) >= total_chunks:
                 break
 
@@ -269,6 +314,10 @@ class QuizAgent:
                 except Exception:
                     store_info.append("unknown")
             
+            logger.warning(
+                "QuizAgent._gather_contexts failed store_info=%s",
+                store_info or [],
+            )
             raise ValueError(
                 "Unable to retrieve any context from the knowledge base. "
                 "This usually means:\n"
@@ -286,6 +335,7 @@ class QuizAgent:
         for idx, entry in enumerate(collected, start=1):
             source_id = f"S{idx}"
             source_map[source_id] = {**entry, "source_id": source_id}
+        logger.info("QuizAgent._gather_contexts source_map=%d", len(source_map))
         return source_map
 
     def _format_context_for_prompt(self, source_map: Dict[str, Dict[str, Any]]) -> str:
@@ -304,59 +354,6 @@ class QuizAgent:
             formatted_blocks.append(f"{header}\n{snippet}")
         return "\n\n".join(formatted_blocks)
 
-    def _build_generation_prompt(
-        self,
-        context_prompt: str,
-        num_mcq: int,
-        num_true_false: int,
-        num_open: int,
-        topics: List[str],
-        difficulty: str,
-    ) -> str:
-        topics_text = ", ".join(topics) if topics else "the network security course materials"
-        difficulty_guidance = {
-            "easy": "Focus on foundational definitions, basic facts, and straightforward recall questions.",
-            "medium": "Blend conceptual understanding with applied reasoning that checks comprehension.",
-            "hard": "Emphasize scenario-based reasoning, multi-step analysis, or nuanced comparisons.",
-        }
-        difficulty_text = difficulty_guidance.get(difficulty, difficulty_guidance["medium"])
-
-        return (
-            "You are NetSec Quiz Agent, an expert tutor who designs assessments strictly from the provided sources.\n"
-            "Using ONLY the context sources below, create a well-balanced quiz covering "
-            f"{topics_text}.\n\n"
-            "Requirements:\n"
-            f"- Provide exactly {num_mcq} multiple-choice, {num_true_false} true/false, and {num_open} open-ended questions.\n"
-            "- Multiple-choice questions must supply four options labelled A, B, C, D and specify the correct option letter.\n"
-            "- True/false questions must have answers \"True\" or \"False\".\n"
-            "- Open-ended questions require a short paragraph answer (3-4 sentences) as the reference solution.\n"
-            "- Every question must include an answer explanation that cites the supporting sources using the IDs [S#].\n"
-            "- Each question must include a \"citations\" array listing the relevant source IDs (e.g., [\"S1\", \"S3\"]).\n"
-            f"- Target difficulty: {difficulty_text}\n"
-            "- Questions must NOT mention filenames, PDFs, or page numbers. Keep them self-contained and conceptual.\n"
-            "- Citations belong only inside answer_explanation; do not place [S#] in the question text or answer field.\n"
-            "- Do NOT fabricate information. If a topic cannot be supported by the sources, adapt the question to what is supported.\n"
-            "- Output MUST be valid JSON with UTF-8 characters that can be parsed directly, with no markdown fencing.\n\n"
-            "Expected JSON schema:\n"
-            "{\n"
-            "  \"quiz_title\": string,\n"
-            "  \"questions\": [\n"
-            "    {\n"
-            "      \"id\": string,\n"
-            "      \"type\": \"multiple_choice\" | \"true_false\" | \"open_ended\",\n"
-            "      \"question\": string,\n"
-            "      \"choices\": [string, string, string, string]  // required for multiple_choice only\n"
-            "      \"answer\": string,  // letter for MCQ, \"True\"/\"False\" for T/F, reference answer text for open_ended\n"
-            "      \"answer_explanation\": string,\n"
-            "      \"citations\": [string, ...]\n"
-            "    }\n"
-            "  ]\n"
-            "}\n\n"
-            "Context sources:\n"
-            f"{context_prompt}\n\n"
-            "Return the JSON object now:\n"
-        )
-
     def _call_llm(self, prompt: str) -> str:
         payload = {
             "model": self.model,
@@ -365,11 +362,19 @@ class QuizAgent:
             "stream": False,
         }
         try:
+            logger.info(
+                "QuizAgent._call_llm model=%s temperature=%s prompt_chars=%d",
+                self.model,
+                self.temperature,
+                len(prompt),
+            )
             response = requests.post(f"{self.base_url}/api/generate", json=payload, timeout=120)
             response.raise_for_status()
             data = response.json()
             text = data.get("response") or ""
-            return text.strip()
+            trimmed = text.strip()
+            logger.info("QuizAgent._call_llm success chars=%d", len(trimmed))
+            return trimmed
         except requests.exceptions.ConnectionError as e:
             raise ConnectionError(
                 f"Failed to connect to Ollama at {self.base_url}. "
@@ -393,24 +398,42 @@ class QuizAgent:
         if not text:
             raise ValueError("Quiz generation returned an empty response.")
         try:
-            return json.loads(text)
+            parsed = json.loads(text)
+            logger.info(
+                "QuizAgent._parse_quiz_json parsed questions=%d",
+                len(parsed.get("questions", [])) if isinstance(parsed, dict) else 0,
+            )
+            return parsed
         except json.JSONDecodeError:
             start = text.find("{")
             end = text.rfind("}")
             if start != -1 and end != -1 and end >= start:
                 snippet = text[start : end + 1]
                 try:
-                    return json.loads(snippet)
+                    parsed = json.loads(snippet)
+                    logger.info(
+                        "QuizAgent._parse_quiz_json recovered_json questions=%d",
+                        len(parsed.get("questions", [])) if isinstance(parsed, dict) else 0,
+                    )
+                    return parsed
                 except json.JSONDecodeError:
                     try:
                         parsed = ast.literal_eval(snippet)
                         if isinstance(parsed, dict):
+                            logger.info(
+                                "QuizAgent._parse_quiz_json literal_eval fallback questions=%d",
+                                len(parsed.get("questions", [])),
+                            )
                             return json.loads(json.dumps(parsed))
                     except (ValueError, SyntaxError):
                         pass
                     raise ValueError(
                         "Failed to parse quiz JSON: Expecting property name enclosed in double quotes."
                     )
+            logger.exception(
+                "QuizAgent._parse_quiz_json invalid JSON response='%s'",
+                summarize_text(text, 200),
+            )
             raise ValueError("Quiz generation response was not valid JSON.")
 
     def _normalize_questions(

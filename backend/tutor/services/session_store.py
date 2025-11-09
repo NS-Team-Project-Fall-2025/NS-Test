@@ -4,9 +4,11 @@ import uuid
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from config import Config
+from ..logging_utils import get_app_logger, summarize_text
 
 
 SESSIONS_DIR_NAME = "chat_sessions"
+logger = get_app_logger()
 
 
 def _sessions_dir() -> str:
@@ -56,17 +58,26 @@ def list_sessions() -> List[Dict[str, Any]]:
             s.get("created_at") or "",
         )
     sessions.sort(key=_sort_key, reverse=True)
+    logger.info("SessionStore.list_sessions count=%d", len(sessions))
     return sessions
 
 
 def load_session(session_id: str) -> Optional[Dict[str, Any]]:
     path = _session_path(session_id)
     if not os.path.exists(path):
+        logger.info("SessionStore.load_session missing session_id=%s", session_id)
         return None
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+            data = json.load(f)
+        logger.info(
+            "SessionStore.load_session session_id=%s message_count=%d",
+            session_id,
+            len(data.get("messages", [])),
+        )
+        return data
+    except Exception as exc:
+        logger.exception("SessionStore.load_session error session_id=%s: %s", session_id, exc)
         return None
 
 
@@ -92,6 +103,14 @@ def save_session(session_id: str, messages: List[Dict[str, Any]], title: Optiona
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    preview = summarize_text(messages[-1]["content"] if messages else "", 80)  # type: ignore[index]
+    logger.info(
+        "SessionStore.save_session session_id=%s title='%s' messages=%d preview='%s'",
+        session_id,
+        data.get("title"),
+        len(messages or []),
+        preview,
+    )
     return data
 
 
@@ -100,15 +119,17 @@ def delete_session(session_id: str) -> bool:
     try:
         if os.path.exists(path):
             os.remove(path)
+            logger.info("SessionStore.delete_session session_id=%s deleted=True", session_id)
             return True
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.exception("SessionStore.delete_session error session_id=%s: %s", session_id, exc)
     return False
 
 
 def create_new_session(title: Optional[str] = None) -> Dict[str, Any]:
     sid = str(uuid.uuid4())
     data = save_session(sid, messages=[], title=title)
+    logger.info("SessionStore.create_new_session session_id=%s title='%s'", sid, data.get("title"))
     return data
 
 

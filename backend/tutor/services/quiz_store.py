@@ -5,8 +5,10 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from config import Config
+from ..logging_utils import get_app_logger
 
 QUIZ_DIR_NAME = "quiz_history"
+logger = get_app_logger()
 
 
 def _quiz_dir() -> str:
@@ -64,17 +66,27 @@ def list_quiz_attempts() -> List[Dict[str, Any]]:
         )
 
     items.sort(key=_sort_key, reverse=True)
+    logger.info("QuizStore.list_quiz_attempts count=%d", len(items))
     return items
 
 
 def load_quiz_attempt(quiz_id: str) -> Optional[Dict[str, Any]]:
     path = _quiz_path(quiz_id)
     if not os.path.exists(path):
+        logger.info("QuizStore.load_quiz_attempt missing quiz_id=%s", quiz_id)
         return None
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+            data = json.load(f)
+        logger.info(
+            "QuizStore.load_quiz_attempt quiz_id=%s topics=%d difficulty=%s",
+            quiz_id,
+            len(data.get("topics") or []),
+            data.get("difficulty"),
+        )
+        return data
+    except Exception as exc:
+        logger.exception("QuizStore.load_quiz_attempt error quiz_id=%s: %s", quiz_id, exc)
         return None
 
 
@@ -103,6 +115,13 @@ def save_quiz_attempt(attempt: Dict[str, Any]) -> Dict[str, Any]:
     path = _quiz_path(quiz_id)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    logger.info(
+        "QuizStore.save_quiz_attempt quiz_id=%s title='%s' topics=%d percentage=%s",
+        quiz_id,
+        data.get("title"),
+        len(data.get("topics") or []),
+        (data.get("results") or {}).get("percentage"),
+    )
     return data
 
 
@@ -111,7 +130,8 @@ def delete_quiz_attempt(quiz_id: str) -> bool:
     try:
         if os.path.exists(path):
             os.remove(path)
+            logger.info("QuizStore.delete_quiz_attempt quiz_id=%s deleted=True", quiz_id)
             return True
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.exception("QuizStore.delete_quiz_attempt error quiz_id=%s: %s", quiz_id, exc)
     return False

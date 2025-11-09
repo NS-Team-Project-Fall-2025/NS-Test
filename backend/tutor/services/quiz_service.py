@@ -7,9 +7,11 @@ from typing import Iterable, List, Sequence, Tuple
 from .knowledge_base import KnowledgeBaseManager, get_kb_manager
 from .quiz_agent import QuizAgent
 from .vector_store import VectorStore
+from ..logging_utils import get_app_logger
 
 
 ALLOWED_QUIZ_CATEGORIES: Tuple[str, str] = ("textbooks", "slides")
+logger = get_app_logger()
 
 
 class QuizService:
@@ -31,6 +33,9 @@ class QuizService:
                     raise ValueError("Selected knowledge base is not ready for quiz generation.")
                 agent = QuizAgent(stores)
                 self._agents[key] = agent
+                logger.info("QuizService.get_agent created key=%s stores=%d", key, len(stores))
+            else:
+                logger.info("QuizService.get_agent cache-hit key=%s", key)
             return agent
 
     def normalize_categories(self, categories: Iterable[str] | None = None) -> List[str]:
@@ -40,6 +45,7 @@ class QuizService:
     def invalidate(self) -> None:
         with self._lock:
             self._agents.clear()
+        logger.info("QuizService.invalidate cleared cached quiz agents")
 
     def _normalize_categories(self, categories: Iterable[str] | None) -> List[str]:
         if not categories:
@@ -63,6 +69,11 @@ class QuizService:
             store = self.kb_manager.ensure_vector_store(category)
             if store is not None and getattr(store, "vectorstore", None) is not None:
                 stores.append(store)
+        logger.info(
+            "QuizService._collect_vector_stores categories=%s stores=%d",
+            list(categories),
+            len(stores),
+        )
         return stores
 
 
