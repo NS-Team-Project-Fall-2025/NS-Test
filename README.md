@@ -33,7 +33,9 @@ NetSec Tutor is an AI-assisted learning environment for Network Security Course.
 
 ## Quick Start
 
+<p align="center">
 <img src="NetSecTutor.gif" width="50%" height="50%"/>
+</p>
 
 
 ### 1. Prepare the environment
